@@ -3,7 +3,7 @@
 ## 文書情報
 
 - **初版日**: 2026-04-29
-- **改訂日**: 2026-05-01
+- **改訂日**: 2026-05-02
 - **ステータス**: 設計フェーズ完了 → 実装計画策定前
 - **対象**: Remap Firmware（本リポジトリ）
 - **ブランチ**: `remap-develop`（QMK 0.32.12 ベース）
@@ -35,7 +35,27 @@ QMK の以下機能を、ウェブから動的に設定変更可能にする：
 
 これらは従来、`config.h` / `keymap.c` 等で C コード記述 + 再ビルドが必要だったが、Remap web app から GUI で設定変更 → EEPROM に永続化 → 即時反映できるようにする。
 
-### 1.3 Out of Scope
+### 1.3 Goal 3: VIA Protocol からの完全分離
+
+本仕様では Remap Firmware が VIA protocol への依存を完全に断ち切る：
+
+- Remap Firmware は **Remap protocol のみ**を喋り、`raw_hid_receive` も Remap dispatcher 一段のみ
+- VIA `via.c` 等の実装はリンクしない
+- VIA eeconfig (32B) は廃止し、Remap 独自 header に統合
+- 既存 dynamic_keymap (VIA 互換) も廃止し、Remap Keymap module で再実装
+
+採択理由：
+1. VIA protocol は歴史的経緯で「最適解ではない」点が多い（API 二重化、channel × value_id の二段階 lookup、eeconfig 領域固定）
+2. Remap は QMK fork として `raw_hid_receive` の制御権を完全に握れる立場にあり、protocol layer を Remap 専用に最適化可能
+3. VIA 互換性を保つコストを払う必要がない（Remap Webapp 側で VIA protocol を別途継続サポートするため、エンドユーザー体験は保たれる）
+
+#### Webapp 側との棲み分け
+
+- **Remap Firmware 側**：Remap protocol のみ
+- **Remap Webapp 側**：VIA protocol（既存 1100+ VIA-only キーボード対応継続）+ Remap protocol（本仕様対応キーボード）の両対応
+- 接続時 probe で判別 → 該当 client を起動
+
+### 1.4 Out of Scope
 
 本仕様の対象外（Tier 3 = C コード直書きで利用）：
 
@@ -45,6 +65,7 @@ QMK の以下機能を、ウェブから動的に設定変更可能にする：
 - **16-key 以上の Combo**（slot 8B 制約、将来 "Combo Plus" として keycode 帯予約のみ）
 - **3-tap 以上の Tap Dance**（slot 8B 制約、将来 "Tap Dance Plus" として予約のみ）
 - **Override の per-layer mask**（全レイヤー固定で割り切り）
+- **VIA protocol との互換性**（Remap firmware と VIA クライアントは接続不可、Webapp 側で VIA をサポート）
 
 ---
 
@@ -57,6 +78,7 @@ Remap Firmware は QMK Firmware の **fork**（`upstream/master` をベースに
 **この設計の利点**：
 - キーボード製作者・keymap 製作者が**追加コードを書かずに** Remap 機能が自動有効化
 - 既存 QMK 機能の挙動を最大限尊重しつつ、動的設定層を上乗せ
+- `raw_hid_receive` の制御権を完全に握れるため、VIA protocol を介さず Remap 独自 protocol で運用可能
 
 **コスト**：
 - QMK upstream への追従義務（`core_patches/` 台帳で patch 管理）
@@ -93,8 +115,8 @@ Remap モジュール群（Tap Dance Lite、Combo Lite、Key Override Lite 等�
 
 | Tier | 内容 | 例 |
 |------|------|------|
-| **Tier 1** | 既存の Remap 拡張（dynamic keymap 等）、改修最小 | dynamic_keymap、Macro |
-| **Tier 2** | 本仕様で新規追加するモジュール群 | Tap Dance Lite、Combo Lite、他 |
+| **Tier 1** | 基幹機能（Keymap、Macro、Lighting/Audio 等の VIA 相当再設計分） | Keymap、Macro、Backlight、RGB Light/Matrix |
+| **Tier 2** | 本仕様で新規追加するモジュール群（Goal 2 中核） | Tap Dance Lite、Combo Lite、他 |
 | **Tier 3** | 動的設定不可能な高度機能。C コード直書きで利用 | Tap Dance callback、Auto Shift Retro |
 
 ユーザーは Tier 3 機能を使いたい場合、QMK の従来手段（`config.h` 編集 + 再ビルド）で対応する。Remap fork はこれを妨げない。
@@ -129,11 +151,23 @@ typedef struct {
 // quantum/remap/remap_modules.c
 const remap_module_t remap_modules[] PROGMEM = {
     { 0x01, remap_meta_handler,         remap_meta_init },
+    { 0x02, remap_keymap_handler,       remap_keymap_init },
+#ifdef REMAP_MACRO_ENABLE
+    { 0x03, remap_macro_handler,        remap_macro_init },
+#endif
+    { 0x05, remap_system_handler,       remap_system_init },
     { 0x10, remap_slot_table_handler,   remap_slot_table_init },
 #ifdef REMAP_CAPS_WORD_ENABLE
     { 0x14, remap_caps_word_handler,    remap_caps_word_init },
 #endif
     // ... 他モジュール
+#ifdef BACKLIGHT_ENABLE
+    { 0x20, remap_backlight_handler,    remap_backlight_init },
+#endif
+#ifdef RGBLIGHT_ENABLE
+    { 0x21, remap_rgblight_handler,     remap_rgblight_init },
+#endif
+    // ... 他 Lighting/Audio モジュール
 };
 const uint8_t remap_module_count = sizeof(remap_modules) / sizeof(remap_module_t);
 ```
@@ -158,57 +192,103 @@ Runtime 層の QMK 統合方式は 4 パターンのいずれか：
 | パターン | 内容 | 例 |
 |---------|------|------|
 | **A. weak callback** | QMK の `__attribute__((weak))` 関数を Remap が override | `caps_word_press_user`、`get_tapping_term` |
-| **B. runtime API 注入** | QMK 公開 API を呼び出して設定変更 | `set_tri_layer_lower_layer()` |
+| **B. runtime API 注入** | QMK 公開 API を呼び出して設定変更 | `set_tri_layer_lower_layer()`、`rgblight_sethsv()` |
 | **C. process_record** | キー入力イベントに介入 | TD slot keycode → QK_TAP_DANCE 変換 |
 | **D. QMK core patch** | QMK 内部のソースを直接改造 | `process_record_quantum`、`tap_dance_actions[]` 外部参照化 |
 
 ### 3.3 EEPROM Region Layout
 
-ATmega32U4（1 KB EEPROM）想定の典型レイアウト：
+ATmega32U4（1 KB EEPROM）想定の典型レイアウト（VIA eeconfig 廃止 → Remap 独自 header 統合）：
 
 ```
 0x000 ─┬─────────────────────┐
-       │ QMK eeconfig         │   32 B  (QMK 既存)
-0x020 ─┼─────────────────────┤
-       │ dynamic_keymap       │  560 B  (Tier 1 既存、4 layer × 70 key × 2B 想定)
-0x250 ─┼─────────────────────┤
-       │ Remap Region         │
-       │  ├ meta region       │  ~20 B  (将来拡張領域含む)
-       │  ├ slot table        │  192 B  (TD 64 + Combo 64 + OVR 64)
-       │  ├ Caps Word config  │   4 B
-       │  ├ One Shot config   │   4 B
-       │  ├ Tri Layer config  │   4 B
-       │  ├ Repeat Key flags  │   1 B
-       │  ├ Auto Shift config │   4 B
-       │  ├ Mouse Keys config │   8 B
-       │  ├ Per-Key Term tbl  │  32 B  (default 8 entries × 4B)
-       │  └ Combo TERM        │   2 B
-0x363 ─┼─────────────────────┤
-       │ Macro region         │  161 B (残り全部)
+       │ Remap Header         │   16 B  (magic / protocol_version /
+       │                      │         layout_options / QMK 互換コア設定)
+0x010 ─┼─────────────────────┤
+       │ Keymap Region        │  560 B  (Keymap module 管理、4 layer × 70 key × 2B 想定)
+0x240 ─┼─────────────────────┤
+       │ Slot Table           │  192 B  (TD 64 + Combo 64 + OVR 64)
+0x300 ─┼─────────────────────┤
+       │ Caps Word config     │   4 B   (#ifdef REMAP_CAPS_WORD_ENABLE)
+       │ One Shot config      │   4 B   (#ifdef REMAP_ONE_SHOT_ENABLE)
+       │ Tri Layer config     │   4 B   (#ifdef REMAP_TRI_LAYER_ENABLE)
+       │ Repeat Key flags     │   1 B   (#ifdef REMAP_REPEAT_KEY_ENABLE)
+       │ Auto Shift config    │   4 B   (#ifdef REMAP_AUTO_SHIFT_ENABLE)
+       │ Mouse Keys config    │   8 B   (#ifdef REMAP_MOUSE_KEYS_ENABLE)
+       │ Per-Key Term tbl     │  32 B   (#ifdef REMAP_PER_KEY_TERM_ENABLE)
+       │ Combo TERM           │   2 B   (#ifdef REMAP_COMBO_LITE_ENABLE)
+       │ Backlight state      │   2 B   (#ifdef BACKLIGHT_ENABLE)
+       │ RGB Light state      │   5 B   (#ifdef RGBLIGHT_ENABLE)
+       │ RGB Matrix state     │   5 B   (#ifdef RGB_MATRIX_ENABLE)
+       │ LED Matrix state     │   3 B   (#ifdef LED_MATRIX_ENABLE)
+       │ Audio state          │   2 B   (#ifdef AUDIO_ENABLE)
+0x34C ─┼─────────────────────┤
+       │ Macro Region         │ ~180 B  (残り全部、keyboard.json で固定)
 0x3FF ─┴─────────────────────┘
 ```
 
 **消費試算（典型 60% キーボード、全モジュール ON、slot 配分 TD=Combo=OVR=8 既定）**：
 ```
-QMK eeconfig:        32 B
-dynamic_keymap:     560 B
-Remap meta region:   20 B
-Remap slot table:   192 B  (TD 64 + Combo 64 + OVR 64)
-Remap modules:       59 B
+Remap Header:      16 B
+Keymap Region:    560 B
+Slot Table:       192 B
+Module configs:    59 B  (Caps Word 4 + One Shot 4 + Tri Layer 4 + Repeat 1 +
+                          Auto Shift 4 + Mouse Keys 8 + Per-Key Term 32 + Combo TERM 2)
+Lighting/Audio:    17 B  (Backlight 2 + RGB Light 5 + RGB Matrix 5 +
+                          LED Matrix 3 + Audio 2)
+Macro Region:     180 B  (残り)
 ─────────────────────────
-合計:               863 B / 1024 B
-Macro 枠残:         161 B
+合計:            1024 B  ✅ ピッタリ
 ```
 
 **注**：slot 配分を `keyboard.json` で変更すると slot table サイズと Macro 枠が連動して伸縮する。
 たとえば slot 合計を論理上限の 32 まで拡張すると slot table は 256 B（+64 B）となり、
-Macro 枠は 97 B（−64 B）に縮小される。逆に slot 配分を絞れば Macro 枠を増やせる。
+Macro 枠は 116 B（−64 B）に縮小される。逆に slot 配分を絞れば Macro 枠を増やせる。
 
-### 3.4 RAM Cache + Save-on-Demand
+VIA eeconfig (32B) を廃止したことで、旧 spec の典型試算（Macro 枠 161B）から **+19B 拡大**している（Header 縮小 +36B − Lighting/Audio 追加 17B = +19B）。
+
+### 3.4 Remap Header 構造
+
+EEPROM 先頭 16B に配置する Remap header：
+
+```c
+typedef struct __attribute__((packed)) {
+    uint8_t  magic[4];          // 0x52,0x4D,0x41,0x50 = ASCII "RMAP"
+    uint8_t  protocol_version;  // probe と同値、整数連番 1, 2, 3...
+    uint8_t  reserved_a;        // alignment
+    uint8_t  default_layer;     // QMK 互換（旧 eeconfig 同義）
+    uint8_t  keymap_config;     // QMK 互換 bit field（swap caps/escape, autocorrect 等）
+    uint32_t layout_options;    // VIA `id_layout_options` 相当を Remap header 内に統合
+    uint8_t  unicode_mode;      // QMK unicode 機能用
+    uint8_t  reserved_tail[3];  // 将来拡張用
+} remap_header_t;  // 16B
+```
+
+**フィールド役割**：
+
+| field | 役割 |
+|-------|------|
+| `magic[4]` | "RMAP" 固定。EEPROM 破損・初回起動の判別 |
+| `protocol_version` | 整数連番。version mismatch 検出（§4.2 probe と必ず同値） |
+| `default_layer` | QMK 起動時のデフォルト layer（互換維持） |
+| `keymap_config` | QMK keymap_config bit field（swap caps/escape, autocorrect 等） |
+| `layout_options` | レイアウトオプション 32bit。Metadata module の GET/SET_LAYOUT_OPTIONS で読み書き |
+| `unicode_mode` | QMK unicode 入力モード（互換維持） |
+| `reserved_a` / `reserved_tail` | 将来拡張用 |
+
+**捨てられた旧 QMK eeconfig フィールド**：
+- 旧 `magic`（`0xFEED 0xFEED`）→ Remap "RMAP" magic に置き換え
+- 旧 `backlight_config` → Backlight module 領域へ移動
+- 旧 `rgblight_config` → RGB Light module 領域へ移動
+- 旧 `audio_config` → Audio module 領域へ移動
+- 旧 `keyboard_specific[15]`（VIA layout_options 32-35B 含む）→ Header `layout_options` に統合、それ以外は捨てる
+- 旧 `steno_mode`、`handedness` → 必要なら keyboard.json or 別領域で対応（Open Items 参照）
+
+### 3.5 RAM Cache + Save-on-Demand
 
 EEPROM の書き込み回数制限（10 万回 / cell）に対応するため、Remap モジュールは：
 
-- **RAM 上にキャッシュ**を持ち、SET 時はまず RAM のみ更新
+- **RAM 上にキャッシュ**を持ち、SET 時はまず RAM のみ更新（実行時挙動は即時反映）
 - ウェブから明示的な `COMMIT_TO_EEPROM` sub_command で初めて EEPROM フラッシュ
 - 起動時は EEPROM → RAM へ一括ロード
 
@@ -231,37 +311,31 @@ uint8_t remap_slot_table_commit(void) {
 
 `eeprom_update_block` は QMK 提供の API で、**変更があったセルのみ書き込む**ため余分な摩耗が発生しない。
 
+このポリシーにより、VIA の `id_custom_save` 相当の明示的 save 命令は不要となる（Save-on-Demand で吸収）。
+
 #### 初回起動・EEPROM 整合性ポリシー
 
-新規ファーム書き込み直後の EEPROM は出荷時 `0xFF` で埋まっているか、旧版データが残存している場合がある。Remap モジュールはこの状態を検知し、安全な初期状態にロールバックする。
+新規ファーム書き込み直後の EEPROM は出荷時 `0xFF` で埋まっているか、旧版データが残存している場合がある。Remap はこの状態を検知し、安全な初期状態にロールバックする。
 
 **検知メカニズム**：
-- Remap meta region の先頭 4B にマジックナンバー（例: `0x52, 0x4D, 0x50, 0x01` = ASCII `'R','M','P'` + `protocol_version`）を格納
+- Remap Header の `magic[4]` = `"RMAP"` を検証
+- 同 Header の `protocol_version` を ROM 内 expected 値と比較
 - 起動時に EEPROM → RAM ロード前に検証
-- 不一致、`0xFF` 連続、または `protocol_version` 不一致の場合、**Remap region 全体をゼロ初期化** + マジックナンバー書き込み
+- 不一致、`0xFF` 連続、または `protocol_version` 不一致の場合、**EEPROM 全領域をゼロ初期化** + Header magic / version 書き込み
 
-**ゼロ初期化の意味**：
-- 全 slot の `type = 0x00` (unused) → ファーム側 no-op で安全
-- 全モジュール設定値が 0 → QMK 標準デフォルト値で動作（Remap モジュールは何も override しない）
-- ユーザーがウェブから設定する前の挙動は QMK 既存挙動に等価
+**ゼロ初期化後の挙動**：
+- Header: `default_layer=0, layout_options=0, ...` → QMK 標準デフォルト
+- Keymap Region: 全 0x00 → 起動時に `keymaps[]` PROGMEM 値で初期化（Keymap module の `RESET` 相当）
+- Slot Table: 全 type=0x00 → unused slot 扱い（ファーム側 no-op で安全）
+- Module configs: 全 0 → QMK 標準デフォルト動作（Remap モジュールは何も override しない）
+- Lighting/Audio state: 全 0 → QMK のデフォルト（多くの場合 disabled 状態）
+- Macro Region: 全 0x00 → macro 全消去状態
 
 **`protocol_version` 不一致時の扱い**：
 - 異なる version で書かれたデータ構造を誤って解釈するリスクを避けるためゼロ初期化
 - ウェブ UI は再接続時に「ファーム更新により設定がリセットされました」を表示する責務を持つ
 
 このポリシーにより、初回起動・EEPROM 破損・ファーム version up のいずれも追加ロジックなく安全に処理される。
-
-### 3.5 dynamic_keymap.c との共存
-
-Remap Region は既存の `dynamic_keymap` 領域の**後ろ**に配置。`DYNAMIC_KEYMAP_MACRO_EEPROM_MAX_ADDR` を override してマクロ枠を Remap Region の後ろに押し込む：
-
-```c
-// keyboard 側 config.h（または Remap fork が定義）
-#define DYNAMIC_KEYMAP_MACRO_EEPROM_MAX_ADDR 0x3FF
-#define DYNAMIC_KEYMAP_MACRO_EEPROM_ADDR     (REMAP_REGION_END)
-```
-
-これにより、既存の dynamic_keymap 機能（VIA 互換）はそのまま動作しつつ、Remap モジュールが領域を占有できる。
 
 ### 3.6 累積オフセットマクロ（`#ifdef` 駆動）
 
@@ -270,10 +344,14 @@ Remap Region は既存の `dynamic_keymap` 領域の**後ろ**に配置。`DYNAM
 ```c
 // quantum/remap/remap_storage_layout.h
 
-#define REMAP_OFFSET_HEADER       (0x250)
-#define REMAP_SIZE_HEADER         (20)
+#define REMAP_OFFSET_HEADER       (0x000)
+#define REMAP_SIZE_HEADER         (16)
 
-#define REMAP_OFFSET_SLOT_TABLE   (REMAP_OFFSET_HEADER + REMAP_SIZE_HEADER)
+#define REMAP_OFFSET_KEYMAP       (REMAP_OFFSET_HEADER + REMAP_SIZE_HEADER)
+#define REMAP_SIZE_KEYMAP \
+    (REMAP_LAYER_COUNT * MATRIX_ROWS * MATRIX_COLS * 2)
+
+#define REMAP_OFFSET_SLOT_TABLE   (REMAP_OFFSET_KEYMAP + REMAP_SIZE_KEYMAP)
 #define REMAP_SIZE_SLOT_TABLE \
     ((REMAP_TD_SLOT_COUNT + REMAP_COMBO_SLOT_COUNT + REMAP_OVR_SLOT_COUNT) * 8)
 // 論理上限は 32 slots × 8B = 256B（keyboard.json の合計 ≤ 32 制約）。
@@ -293,7 +371,27 @@ Remap Region は既存の `dynamic_keymap` 領域の**後ろ**に配置。`DYNAM
 #  define REMAP_SIZE_ONE_SHOT     (0)
 #endif
 
-// ... 以下同様に累積
+// ... Tri Layer / Repeat Key / Auto Shift / Mouse Keys / Per-Key Term / Combo TERM
+//     も同様
+
+#define REMAP_OFFSET_BACKLIGHT    (REMAP_OFFSET_COMBO_TERM + REMAP_SIZE_COMBO_TERM)
+#ifdef BACKLIGHT_ENABLE
+#  define REMAP_SIZE_BACKLIGHT    (2)
+#else
+#  define REMAP_SIZE_BACKLIGHT    (0)
+#endif
+
+#define REMAP_OFFSET_RGBLIGHT     (REMAP_OFFSET_BACKLIGHT + REMAP_SIZE_BACKLIGHT)
+#ifdef RGBLIGHT_ENABLE
+#  define REMAP_SIZE_RGBLIGHT     (5)
+#else
+#  define REMAP_SIZE_RGBLIGHT     (0)
+#endif
+
+// ... RGB Matrix / LED Matrix / Audio も同様
+
+#define REMAP_OFFSET_MACRO        (REMAP_OFFSET_AUDIO + REMAP_SIZE_AUDIO)
+#define REMAP_SIZE_MACRO          (REMAP_MACRO_BUFFER_SIZE)  // keyboard.json で固定
 ```
 
 無効化されたモジュールは 0 バイト消費。マクロ枠を最大化できる。
@@ -312,11 +410,11 @@ Byte  1:    sub_cmd       (リクエスト) / status (レスポンス)
 Byte 2-31:  payload       (最大 30 バイト)
 ```
 
-**特殊**: `module_id == 0xFE` は probe handshake 用に予約（VIA との衝突回避のため）。
+**特殊**: `module_id == 0xFE` は probe handshake 用に予約。
 
 ### 4.2 Probe Handshake
 
-ウェブアプリは接続時に最初に probe を送信し、Remap firmware か VIA firmware かを判別する。
+ウェブアプリは接続時に最初に probe を送信し、Remap firmware か別の firmware（VIA、未対応 firmware 等）かを判別する。
 
 #### Probe Request（ウェブ → ファーム）
 ```
@@ -333,18 +431,27 @@ Byte  1: 0x00
 Byte  2-6: 'R', 'M', 'A', 'P', '!'   (magic = "RMAP!")
 Byte  7: protocol_version             (uint8_t、整数連番 1, 2, 3, ...)
 Byte  8: reserved                      (0x00)
-Byte  9-10: capability_flags          (uint16_t LE、将来拡張用)
+Byte  9-10: capability_flags          (uint16_t LE、機能可否ビット)
 Byte 11-31: reserved                   (0x00)
 ```
 
 **識別ロジック**：
-- VIA firmware は `module_id=0xFE` を不明コマンド扱いし、`0xFF` 応答する → Remap と区別可能
-- Remap firmware は magic `"RMAP!"` を返す → ウェブは即座に認識
+- Remap firmware は magic `"RMAP!"` を返す → ウェブは即座に認識し Remap protocol client を起動
+- それ以外（VIA firmware は未知コマンド扱い等）→ ウェブ側 fallback ロジックで VIA protocol client を起動
 
 **protocol_version の役割**：
 - ウェブアプリが互換性判定を**通信の最初期**に行うために存在
 - 整数連番（1, 2, 3, …）で運用。semver の minor/patch のような小数構造は持たない（プロトコルは互換 / 非互換の二値判断のため）
 - 例：ウェブが `protocol_version=2` までしか知らないが、ファームが `3` を返した → 「未対応バージョンです」と即エラー表示
+
+**capability_flags のビット割り当て**：
+```
+bit 0:  bootloader_available    - System module BOOTLOADER_JUMP が機能するか
+bit 1:  matrix_state_available  - System module GET_MATRIX_STATE が機能するか（通常 1）
+bit 2-15: reserved              - 将来拡張用
+```
+
+これにより Webapp は probe 応答だけで「フラッシュ更新ボタンを表示するか」「Matrix Tester を提供するか」等を即時判断できる。
 
 ### 4.3 Module Dispatch
 
@@ -398,12 +505,18 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
 }
 ```
 
+VIA dispatcher を併走させない単段構成のため、Remap firmware は VIA クライアントに対して全コマンドが「未対応」として応答する。これは仕様であり、Webapp 側で probe 結果に基づき VIA / Remap いずれの client を使うか判定する。
+
 ### 4.4 Module ID Allocation Map
 
 ```
 0x00         (reserved)
 0x01         Metadata
-0x02-0x0F    (reserved for future global modules)
+0x02         Keymap
+0x03         Macro
+0x04         (reserved)
+0x05         System
+0x06-0x0F    (reserved for future global modules)
 0x10         Slot Table（TD/Combo/Override 共通スロット管理）
 0x11         (reserved)
 0x12         Combo（補完設定：COMBO_TERM）
@@ -415,9 +528,15 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
 0x18         Auto Shift
 0x19         Mouse Keys
 0x1A         Per-Key Term
-0x1B-0xFD    (reserved for future modules)
+0x1B-0x1F    (reserved for Tier 2 拡張)
+0x20         Backlight
+0x21         RGB Light
+0x22         RGB Matrix
+0x23         Audio
+0x24         LED Matrix
+0x25-0xFD    (reserved for future modules)
 0xFE         Probe handshake（予約、通常 dispatch 対象外）
-0xFF         (reserved、VIA との衝突回避用に未使用)
+0xFF         (reserved)
 ```
 
 ### 4.5 Error Codes（status バイト）
@@ -437,27 +556,106 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
 
 すべての多バイト整数は **little-endian**（AVR / ARM どちらも native LE のため）。`__attribute__((packed))` 構造体で直接シリアライズ可能。
 
+### 4.7 Multi-packet Transfer Protocol（Stateless Offset-based）
+
+HID 1 パケット 30B payload に収まらないデータ（string table、layout、keymap buffer、macro buffer 等）の転送を、**stateless offset-based** で統一的に扱う。
+
+#### 設計思想
+
+- ファーム側で cursor / state を持たない（AVR で割り込み・USB 切断・並行クライアントを考えると stateless が最適）
+- すべての chunked GET/SET はリクエストに `offset` を明示
+- レスポンスは `total_bytes`（全体サイズ）と `chunk_len`（このパケットで返した実バイト数）を返す
+- EOF はサイズで判定（特別な END マーカー不要）
+
+#### Wire Format（GET 系）
+
+**リクエスト（32B）**
+```
+Byte 0    : module_id
+Byte 1    : sub_cmd
+Byte 2-3  : offset (uint16_t LE、要求するバイト位置)
+Byte 4-31 : reserved (zero)
+```
+
+**レスポンス（32B）**
+```
+Byte 0    : module_id (echoed)
+Byte 1    : status (0x00 OK)
+Byte 2-3  : total_bytes  (uint16_t LE、転送対象の全体サイズ、毎回返す)
+Byte 4-5  : offset_echoed (uint16_t LE、要求 offset の echo)
+Byte 6    : chunk_len (uint8_t、本パケットのデータ実バイト数、0-26)
+Byte 7-31 : data (chunk_len バイト + zero-fill)
+```
+
+#### Wire Format（SET 系、対称適用）
+
+**リクエスト（32B）**
+```
+Byte 0    : module_id
+Byte 1    : sub_cmd
+Byte 2-3  : offset (uint16_t LE、書き込み開始位置)
+Byte 4    : chunk_len (uint8_t、書き込むデータバイト数、0-25)
+Byte 5-29 : data (chunk_len バイト + zero-fill)
+Byte 30-31: reserved (zero)
+```
+
+**レスポンス（32B）**
+```
+Byte 0    : module_id
+Byte 1    : status
+Byte 2-31 : reserved (zero)
+```
+
+#### ホスト側 GET ループ（リファレンス疑似コード）
+
+```python
+offset = 0
+buffer = bytearray()
+while True:
+    resp = send(module_id, sub_cmd, offset=offset)
+    buffer.extend(resp.data[:resp.chunk_len])
+    offset += resp.chunk_len
+    if offset >= resp.total_bytes:
+        break  # ← EOF はサイズで判定、特別な END マーカー不要
+    if resp.chunk_len == 0:
+        raise Error  # 進まない＝バグ
+```
+
+#### 採用根拠
+
+- AVR 上で state を持たないのが鉄則：割り込み・USB 切断・並行クライアントを考えると stateless が最強
+- §9.4 既存の `GET_SLOT(type, idx)` がすでに stateless offset-style なので、spec 全体で揃う
+- payload 26B vs 28B の差は実用上誤差（string table が数百 B → ±数パケット差にしかならない）
+
+#### 適用 sub_cmd 一覧
+
+本プロトコルは以下の sub_cmd で使用される：
+
+- `Metadata.GET_STRING_TABLE`、`GET_LAYOUTS`、`GET_LED_POSITIONS`、`GET_CUSTOM_KEYCODES`
+- `Keymap.GET_BUFFER`、`SET_BUFFER`
+- `Macro.GET_BUFFER`、`SET_BUFFER`
+
+将来 chunked transfer が必要な sub_cmd を追加する場合も、本プロトコルに従う。
+
 ---
 
 ## 5. Module: Metadata（module_id=0x01）
 
-VIA JSON 撤廃の中核。キーボードのあらゆるメタデータを動的応答する。
+VIA JSON 撤廃の中核。キーボードのあらゆるメタデータを動的応答する。加えて、`layout_options` の SET 系も提供する（旧 VIA `id_set_keyboard_value(id_layout_options)` 相当）。
 
 ### 5.1 Sub-commands
 
 ```
 0x01  GET_BASIC                     (基本情報 26B)
-0x02  GET_STRING_TABLE_BEGIN        (string table 取得開始)
-0x03  GET_STRING_TABLE_CONTINUE     (続き)
-0x04  GET_LAYOUTS_BEGIN             (KLE レイアウト)
-0x05  GET_LAYOUTS_CONTINUE
-0x06  GET_LAYOUT_OPTIONS            (レイアウトオプション)
-0x07  GET_LED_POSITIONS_BEGIN       (RGB matrix 等の LED 位置)
-0x08  GET_LED_POSITIONS_CONTINUE
-0x09  GET_CUSTOM_KEYCODES_BEGIN     (カスタムキーコード一覧)
-0x0A  GET_CUSTOM_KEYCODES_CONTINUE
-0x0B  GET_ENCODER_INFO              (エンコーダ情報)
+0x02  GET_STRING_TABLE              (string table 取得、§4.7 chunked)
+0x03  GET_LAYOUTS                   (KLE レイアウト取得、§4.7 chunked)
+0x04  GET_LED_POSITIONS             (LED 位置取得、§4.7 chunked)
+0x05  GET_CUSTOM_KEYCODES           (カスタムキーコード取得、§4.7 chunked)
+0x06  GET_LAYOUT_OPTIONS            (レイアウトオプション 4B 取得)
+0x07  SET_LAYOUT_OPTIONS            (レイアウトオプション 4B 設定)
 ```
+
+旧 spec の `GET_xxx_BEGIN` / `GET_xxx_CONTINUE` ペアは §4.7 stateless offset-based に統合され、各機能 1 sub_cmd に削減された。旧 `GET_ENCODER_INFO` は webapp 側で利用機会が無いため廃止（encoder の数は §5.2 `num_encoders` で取得、keymap は Keymap module で取得）。
 
 ### 5.2 `remap_meta_basic_t` 構造（26B）
 
@@ -498,7 +696,7 @@ HID 30B payload に対して struct 26B → 余り 4B。すべて `0x00` zero-fi
 
 **プロトコル拡張ポリシー**：将来フィールド追加時、`reserved_tail` から順に消費する。最後に追加されたフィールドの位置は **protocol_version の bump** で示す。
 
-### 5.3 String Table（UTF-8）
+### 5.3 String Table（UTF-8、§4.7 chunked）
 
 キーボード名・KLE label・カスタムキーコード名等を格納する**長さ前置文字列の配列**。エンコーディングは **UTF-8**（日本語キーボードの label にも対応）。
 
@@ -515,9 +713,9 @@ HID 30B payload に対して struct 26B → 余り 4B。すべて `0x00` zero-fi
 [length: uint8_t][bytes: UTF-8 sequence (length バイト)]
 ```
 
-最大 255 バイト/エントリ。1 パケット 30B 内に収まらない場合は CONTINUE で分割。
+最大 255 バイト/エントリ。30B payload に収まらない場合、§4.7 stateless offset-based で chunked 取得。
 
-### 5.4 Layouts / LED Positions / Encoders
+### 5.4 Layouts / LED Positions（§4.7 chunked）
 
 #### KLE Layout の表現
 
@@ -536,26 +734,45 @@ typedef struct __attribute__((packed)) {
 } remap_layout_key_t;       // 8B/key
 ```
 
-8 B/key × ~70 key（典型 60%）= ~560 B → 1 パケット 30B 内に 3 key 収まる → ~24 パケットで全 layout 取得。
+8 B/key × ~70 key（典型 60%）= ~560 B → 1 パケット 26B 内に 3 key 収まる → ~24 パケットで全 layout 取得（§4.7 chunked）。
 
 #### LED Positions
 
-RGB matrix / LED matrix が ON の場合のみ。同様に 8B/LED 構造で取得。
+RGB matrix / LED matrix が ON の場合のみ。同様に 8B/LED 構造で取得（§4.7 chunked）。`remap_led_position_t` の正式定義は Open Items 参照。
 
-#### Encoder Info
+### 5.5 Layout Options（GET / SET）
 
-```c
-typedef struct __attribute__((packed)) {
-    uint8_t  pin_a;
-    uint8_t  pin_b;
-    uint8_t  resolution;
-    uint8_t  flags;          // bit0=clockwise_keycode_assigned, etc.
-} remap_encoder_t;           // 4B/encoder
+#### GET_LAYOUT_OPTIONS (0x06)
+```
+Request (32B):
+  Byte 0:    0x01 (module_id)
+  Byte 1:    0x06 (sub_cmd)
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x01
+  Byte 1:    status
+  Byte 2-5:  layout_options (uint32 LE、bit field)
+  Byte 6-31: 0x00
 ```
 
-### 5.5 Layout Options
+#### SET_LAYOUT_OPTIONS (0x07)
+```
+Request (32B):
+  Byte 0:    0x01
+  Byte 1:    0x07
+  Byte 2-5:  layout_options (uint32 LE)
+  Byte 6-31: 0x00
 
-VIA 互換性のため、layout options は **VIA 既存の eeconfig 領域**（バイト 32-35）を流用する。これにより VIA / Remap いずれでも同じ option 値を読み書き可能。
+Response (32B):
+  Byte 0:    0x01
+  Byte 1:    status (0x00=OK, 0x05=EEPROM_WRITE_FAIL)
+  Byte 2-31: 0x00
+```
+
+**SET 後の挙動**：§3.5 RAM Cache + Save-on-Demand に準拠（dirty フラグ立てて遅延 commit、RAM cache は即更新で実行時挙動は即時反映）。
+
+**EEPROM 配置**：Remap Header の `layout_options` フィールド（§3.4）に格納。VIA eeconfig 領域は使わない。
 
 ### 5.6 Build-time Generation
 
@@ -608,11 +825,219 @@ PROGMEM 消費は典型 60% キーボードで約 1.1 KB FLASH。
 
 ---
 
-## 6. Module: Slot Table（module_id=0x10）
+## 6. Module: Keymap（module_id=0x02）
+
+VIA `id_dynamic_keymap_*` 群の Remap 版実装。layer × row × col の単一キー編集、bulk transfer、reset、encoder keycode 編集を提供する。
+
+### 6.1 Sub-commands
+
+```
+0x01  GET_KEYCODE              ([layer:1, row:1, col:1])               → [keycode:2 LE]
+0x02  SET_KEYCODE              ([layer:1, row:1, col:1, keycode:2 LE])  → []
+0x03  RESET                    ()                                       → []
+0x04  GET_BUFFER               ([offset:2 LE])                          → §4.7 chunked
+0x05  SET_BUFFER               ([offset:2 LE, chunk_len:1, data:≤25])   → []
+0x06  GET_ENCODER_KEYCODE      ([layer:1, encoder_id:1, direction:1])   → [keycode:2 LE]
+0x07  SET_ENCODER_KEYCODE      ([layer:1, encoder_id:1, direction:1, keycode:2 LE]) → []
+```
+
+`direction`: `0x00 = counterclockwise`, `0x01 = clockwise`
+
+### 6.2 Index 方式
+
+VIA と同じく **三次元 `(layer, row, col)`** で索引する。Keymap buffer のメモリ配置は `layer × matrix_rows × matrix_cols × 2 bytes`（layer-major）。
+
+`GET_BUFFER` の `total_bytes` = `num_layers × matrix_rows × matrix_cols × 2`。
+
+### 6.3 詳細仕様
+
+#### `GET_KEYCODE` (0x01)
+```
+Request (32B):
+  Byte 0:    0x02 (module_id)
+  Byte 1:    0x01 (sub_cmd)
+  Byte 2:    layer
+  Byte 3:    row
+  Byte 4:    col
+  Byte 5-31: 0x00
+
+Response (32B):
+  Byte 0:    0x02
+  Byte 1:    status (0x00=OK, 0x04=INVALID_PARAMS)
+  Byte 2-3:  keycode (uint16 LE)
+  Byte 4-31: 0x00
+```
+
+#### `SET_KEYCODE` (0x02)
+```
+Request (32B):
+  Byte 0:    0x02
+  Byte 1:    0x02
+  Byte 2:    layer
+  Byte 3:    row
+  Byte 4:    col
+  Byte 5-6:  keycode (uint16 LE)
+  Byte 7-31: 0x00
+
+Response (32B):
+  Byte 0:    0x02
+  Byte 1:    status (0x00=OK, 0x04=INVALID_PARAMS, 0x05=EEPROM_WRITE_FAIL)
+  Byte 2-31: 0x00
+```
+
+#### `RESET` (0x03)
+全 layer × row × col を **PROGMEM の `keymaps[][][]` 配列で初期化**（QMK の `dynamic_keymap_reset()` 相当）。encoder 用 keycode も `encoder_map[][][]` PROGMEM 値で初期化。
+
+#### `GET_BUFFER` / `SET_BUFFER` (0x04 / 0x05)
+§4.7 案 A の **stateless offset-based protocol** を流用。Keymap region 全体を bulk transfer 可能。Webapp 起動時の初期 fetch は bulk、編集後の単発書き込みは `SET_KEYCODE` という使い分けを想定。
+
+#### `GET_ENCODER_KEYCODE` / `SET_ENCODER_KEYCODE` (0x06 / 0x07)
+encoder の clockwise / counterclockwise キー設定。encoder 数は §5.2 metadata `num_encoders` で取得済み前提。Encoder データは小さいため bulk transfer は提供しない。
+
+### 6.4 Keycode 範囲チェック方針
+
+`SET_KEYCODE` / `SET_ENCODER_KEYCODE` / `SET_BUFFER` で受信した keycode の **範囲チェックは行わない**（webapp 側が責任を持つ）。これにより protocol が単純化され、ファーム実装サイズも削減される。
+
+### 6.5 EEPROM 配置
+
+Keymap region は §3.3 の `0x010` から `REMAP_LAYER_COUNT × MATRIX_ROWS × MATRIX_COLS × 2` バイト。Encoder keycode は別領域（keyboard.json で設定、典型 4 layer × 2 enc × 2 dir × 2B = 32B 程度）に配置。詳細レイアウト確定は Open Items 参照。
+
+---
+
+## 7. Module: Macro（module_id=0x03）
+
+VIA macro 5 sub_cmd（`get_count` / `get_buffer_size` / `get_buffer` / `set_buffer` / `reset`）を **4 sub_cmd に集約**。
+
+### 7.1 Sub-commands
+
+```
+0x01  GET_INFO       ()                                      → [count:1, buffer_size:2 LE]
+0x02  GET_BUFFER     ([offset:2 LE])                         → §4.7 chunked
+0x03  SET_BUFFER     ([offset:2 LE, chunk_len:1, data:≤25])  → []
+0x04  RESET          ()                                       → []
+```
+
+### 7.2 詳細仕様
+
+#### `GET_INFO` (0x01)
+1 packet で macro 全体情報取得。`get_count` + `get_buffer_size` を統合。
+
+```
+Request (32B):
+  Byte 0:    0x03 (module_id)
+  Byte 1:    0x01 (sub_cmd)
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x03
+  Byte 1:    status
+  Byte 2:    count        (uint8、サポートする macro 数、典型 16)
+  Byte 3-4:  buffer_size  (uint16 LE、macro 領域のバイト数)
+  Byte 5-31: 0x00
+```
+
+#### `GET_BUFFER` / `SET_BUFFER` (0x02 / 0x03)
+§4.7 案 A をそのまま流用。`total_bytes` は `buffer_size` と一致。
+
+#### `RESET` (0x04)
+Macro buffer 全体を **0x00 で埋める**。
+
+### 7.3 Macro Buffer データ構造
+
+VIA との互換性は不要だが、**null-terminator 区切り方式**を採用：
+
+```
+[macro_0_bytes][0x00][macro_1_bytes][0x00]...[macro_N-1_bytes][0x00][unused 0x00 fill]
+```
+
+採用理由：
+1. **実装シンプル**：macro N を取り出すには先頭から N 個目の `0x00` までを読むだけ
+2. **可変長対応**：各 macro が異なる長さを持てる
+3. **空 macro 表現**：`[0x00]` のみ = 空 macro
+4. **既存 QMK の `dynamic_keymap_macro_send()` ロジックそのまま流用可能**（QMK fork の利点）
+
+#### Macro データの内部表現
+QMK の既存仕様を踏襲：
+- 通常文字：そのまま 1 バイト
+- 特殊シーケンス：`SS_TAP_CODE / SS_DOWN_CODE / SS_UP_CODE / SS_DELAY_CODE` 等の escape sequence
+- これは QMK core 側の `dynamic_keymap_macro_send()` がそのまま解釈する
+
+### 7.4 個別 macro の get/set
+
+提供しない（`GET_BUFFER` / `SET_BUFFER` の bulk のみ）。Macro 編集の頻度は低いので buffer 一括書き戻しで十分、sub_cmd 削減で protocol を clean に保つ。
+
+### 7.5 Build-time 制御
+
+`rules.mk` に `REMAP_MACRO_ENABLE = yes` を設定したキーボードのみ Macro module が有効化される（opt-in）。EEPROM 容量制約（特に 32U4）に配慮し、必要なキーボードだけ有効化する方針。Macro buffer サイズは `keyboard.json` の `remap.macro.buffer_size` で固定（典型 161-196B）。
+
+### 7.6 Macro count の通知方法
+
+§5.2 metadata `remap_meta_basic_t` には macro count を含めない。Macro module の `GET_INFO` で取得することで、Metadata 構造体の肥大化を避け責務分離を保つ。
+
+---
+
+## 8. Module: System（module_id=0x05）
+
+VIA の `id_eeprom_reset` / `id_bootloader_jump` / `id_get_keyboard_value(id_switch_matrix_state)` を統合した system 制御モジュール。
+
+### 8.1 Sub-commands
+
+```
+0x01  GET_MATRIX_STATE   ()  → [bitmap_size:1, bitmap:N]
+0x02  EEPROM_RESET       ()  → []
+0x03  BOOTLOADER_JUMP    ()  → []  (送信完了後 reset_keyboard())
+```
+
+### 8.2 詳細仕様
+
+#### `GET_MATRIX_STATE` (0x01)
+キー押下状態を bit packed bitmap で返す。webapp Matrix Tester が ~60 Hz でポーリング想定。
+
+```
+Request (32B):
+  Byte 0:    0x05 (module_id)
+  Byte 1:    0x01 (sub_cmd)
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x05
+  Byte 1:    status
+  Byte 2:    bitmap_size  (uint8、bitmap バイト数 = ceil(rows × cols / 8))
+  Byte 3-?:  bitmap       (key (r,c) → bit (r × MATRIX_COLS + c))
+  Byte ?-31: 0x00
+```
+
+**bitmap サイズ試算**：
+- 60% (5×14 = 70 keys)：9 B
+- TKL (6×17 = 102 keys)：13 B
+- フルサイズ (6×21 = 126 keys)：16 B
+- ergodox (14×7 = 98 keys)：13 B
+
+→ **30B payload 内で全実用キーボード対応可能**（最大 240 keys まで）。240 keys 超は将来の chunked 対応として punt。
+
+#### `EEPROM_RESET` (0x02)
+**全 EEPROM をゼロ初期化** → Remap Header magic 書き込み → 起動時の post_init で各モジュール defaults 復元。§3.5 の「初回起動・EEPROM 整合性ポリシー」を手動トリガー。
+
+reset 完了後の **MCU 自動 reboot は行わない**。Webapp が必要時に明示的に `BOOTLOADER_JUMP` 等で対応。
+
+#### `BOOTLOADER_JUMP` (0x03)
+DFU bootloader 起動。フラッシュ更新時に webapp から呼び出される。
+
+実装：レスポンス送信完了後に `reset_keyboard()` を呼ぶ。送信前に jump すると webapp タイムアウト扱いになるため、順序は厳守。
+
+無効ビルド（`BOOTLOADER = none` 等）の場合：sub_cmd 自体を未対応扱い → `STATUS_UNKNOWN_SUB_CMD` 返却。Webapp は §4.2 `capability_flags.bit0 = bootloader_available` で事前判定可能。
+
+### 8.3 将来拡張余地
+
+uptime / device_indication 等の VIA 機能は本仕様で「Remap 不要」と判断され削除されたが、将来 debug 機能で必要になった場合、System module の sub_cmd `0x04` 以降に追加可能。
+
+---
+
+## 9. Module: Slot Table（module_id=0x10）
 
 Goal 2 の中核。Tap Dance / Combo / Key Override の動的設定を統一スロット構造で管理する。
 
-### 6.1 `custom_slot_t` 統一構造（8B）
+### 9.1 `custom_slot_t` 統一構造（8B）
 
 ```c
 typedef struct __attribute__((packed)) {
@@ -626,7 +1051,7 @@ typedef struct __attribute__((packed)) {
 
 各モジュールは `param0/1/2` の意味を独自定義する（後述）。
 
-### 6.2 モジュール別配分（β 配分方式）
+### 9.2 モジュール別配分（β 配分方式）
 
 統一プールではなく、モジュール別に**ビルド時固定の専用配列**を持つ：
 
@@ -658,7 +1083,7 @@ custom_slot_t ovr_slots[REMAP_OVR_SLOT_COUNT];    // default 8
 - ビルド時にメモリ完全予測
 - ウェブ UI も「TD タブ / Combo タブ / Override タブ」と分離するのが自然
 
-### 6.3 keycode マッピング（動的予約）
+### 9.3 keycode マッピング（動的予約）
 
 Tap Dance のみ keymap 配置が必要なため、**TD slot 数に応じて keycode 帯が動的にサイズ変動**：
 
@@ -671,7 +1096,7 @@ Tap Dance のみ keymap 配置が必要なため、**TD slot 数に応じて key
 
 **Combo / Override は scan 方式**で keymap 配置不要のため、keycode 帯を消費しない。
 
-### 6.4 Sub-commands
+### 9.4 Sub-commands
 
 ```
 0x01  GET_SLOT(type:1B, idx:1B)               → 8B slot data
@@ -683,7 +1108,7 @@ Tap Dance のみ keymap 配置が必要なため、**TD slot 数に応じて key
 - `GET_SLOT` は逐次取得（24 slot で約 500ms、起動時 1 回限定なので許容）
 - バリデーションは**ファーム側で slot_index 範囲チェックのみ**。型・keycode 整合性はウェブ UI 側で事前検証する責務。
 
-### 6.5 空 slot の扱い
+### 9.5 空 slot の扱い
 
 ユーザーが keymap に `REMAP_USER_5` を配置したが TD slot 5 の `type == 0x00 (unused)` の場合：
 - **ファーム側**: 完全に no-op（押しても何も起きない）
@@ -693,11 +1118,11 @@ Tap Dance のみ keymap 配置が必要なため、**TD slot 数に応じて key
 
 ---
 
-## 7. Module: Tap Dance Lite（slot type=0x01）
+## 10. Module: Tap Dance Lite（slot type=0x01）
 
 QMK Tap Dance を facade として活用する設計。
 
-### 7.1 QMK facade 実装方針
+### 10.1 QMK facade 実装方針
 
 QMK の `tap_dance_actions[]` は通常 `static const` 配列だが、Remap fork で **non-const + 外部参照可能なポインタ**に core patch する：
 
@@ -721,7 +1146,7 @@ void remap_tap_dance_lite_init(void) {
             remap_td_actions[i] = (qk_tap_dance_action_t)
                 ACTION_TAP_DANCE_TAP_HOLD(slot->param0, slot->param1);
             // tap=param0, hold=param1, double_tap=param2 を組み合わせる
-            // （詳細は 7.4 参照）
+            // （詳細は 10.4 参照）
         }
     }
     tap_dance_actions = remap_td_actions;
@@ -729,7 +1154,7 @@ void remap_tap_dance_lite_init(void) {
 }
 ```
 
-### 7.2 Slot レイアウト
+### 10.2 Slot レイアウト
 
 ```c
 // type = 0x01 (Tap Dance)
@@ -744,7 +1169,7 @@ void remap_tap_dance_lite_init(void) {
 }
 ```
 
-### 7.3 flags ビットレイアウト
+### 10.3 flags ビットレイアウト
 
 QMK 標準の挙動制御に対応するビット：
 
@@ -758,13 +1183,13 @@ QMK 標準の挙動制御に対応するビット：
 
 これらは QMK の per-key callback（`get_permissive_hold` 等）を Remap が実装し、slot の flags を読んで応答する形で実現する。
 
-### 7.4 制約
+### 10.4 制約
 
 - **callback 関数ポインタ不可**：QMK の `ACTION_TAP_DANCE_FN` 系統は使えない（C 関数ポインタ EEPROM 保存不可）
 - **2-tap + hold まで**：slot 8B で表現できる action は 3 種（tap / hold / double_tap）が物理限界
 - **TAPPING_TERM はグローバル固定**：slot 別調整は持たない（必要なら Per-Key Term モジュール経由）
 
-### 7.5 Future: Tap Dance Plus
+### 10.5 Future: Tap Dance Plus
 
 3-tap 以上を将来サポートする場合に備えて：
 - keycode 帯 `0x7840-0x785F` を**予約のみ**（実装は Tier 2 第二弾）
@@ -772,11 +1197,11 @@ QMK 標準の挙動制御に対応するビット：
 
 ---
 
-## 8. Module: Combo Lite（slot type=0x02）
+## 11. Module: Combo Lite（slot type=0x02）
 
 QMK Combo を facade として活用。
 
-### 8.1 QMK combo_t facade
+### 11.1 QMK combo_t facade
 
 `tap_dance_actions[]` と同様、QMK の `combo_t key_combos[]` を core patch で外部参照化し、Remap が動的構築する。
 
@@ -810,7 +1235,7 @@ void remap_combo_lite_init(void) {
 }
 ```
 
-### 8.2 Slot レイアウト（2-key trigger 限定）
+### 11.2 Slot レイアウト（2-key trigger 限定）
 
 ```c
 // type = 0x02 (Combo)
@@ -823,7 +1248,7 @@ void remap_combo_lite_init(void) {
 }
 ```
 
-### 8.3 補完設定（module_id=0x12）
+### 11.3 補完設定（module_id=0x12）
 
 slot に収まらないグローバル設定として `COMBO_TERM` を持つ：
 
@@ -841,7 +1266,7 @@ Sub-commands:
 
 EEPROM 消費 2B。
 
-### 8.4 Future: Combo Plus
+### 11.4 Future: Combo Plus
 
 n-key trigger（3-16 keys）対応は将来の Tier 2 拡張：
 - keycode 帯 `0x7820-0x783F` を予約のみ
@@ -849,11 +1274,11 @@ n-key trigger（3-16 keys）対応は将来の Tier 2 拡張：
 
 ---
 
-## 9. Module: Key Override Lite（slot type=0x03）
+## 12. Module: Key Override Lite（slot type=0x03）
 
 QMK Key Override を facade として活用。
 
-### 9.1 QMK key_override_t facade
+### 12.1 QMK key_override_t facade
 
 ```c
 // QMK fork で patch
@@ -889,7 +1314,7 @@ void remap_key_override_lite_init(void) {
 }
 ```
 
-### 9.2 Slot レイアウト
+### 12.2 Slot レイアウト
 
 ```c
 // type = 0x03 (Key Override)
@@ -902,7 +1327,7 @@ void remap_key_override_lite_init(void) {
 }
 ```
 
-### 9.3 全レイヤー固定（layer mask 持たず）
+### 12.3 全レイヤー固定（layer mask 持たず）
 
 QMK 本家の `key_override_t.layers`（per-layer mask）は **全レイヤー（`~0`）に固定**。slot 8B 内に layer mask を入れる余地がなく、また実用上「全レイヤーで動作」が大多数のため割り切る。
 
@@ -910,9 +1335,9 @@ per-layer 制御が必要な場合は、QMK 本家機能（C コード直書き�
 
 ---
 
-## 10. Other Modules
+## 13. Other Modules
 
-### 10.1 Caps Word（module_id=0x14）
+### 13.1 Caps Word（module_id=0x14）
 
 QMK Caps Word を facade。`caps_word_press_user` weak callback を Remap が実装。
 
@@ -934,7 +1359,7 @@ struct caps_word_config {
 0x02  SET_CONFIG(4B)     → 1B status
 ```
 
-### 10.2 One Shot（module_id=0x15）
+### 13.2 One Shot（module_id=0x15）
 
 QMK One Shot Modifier / Layer をそのまま使用。設定値を `keymap_config` 等に動的反映。
 
@@ -947,7 +1372,7 @@ struct one_shot_config {
 };
 ```
 
-### 10.3 Tri Layer（module_id=0x16）
+### 13.3 Tri Layer（module_id=0x16）
 
 QMK の `set_tri_layer_*_layer()` API 経由で動的設定。
 
@@ -961,7 +1386,7 @@ struct tri_layer_config {
 };
 ```
 
-### 10.4 Repeat Key（module_id=0x17）
+### 13.4 Repeat Key（module_id=0x17）
 
 QMK Repeat Key / Alt Repeat Key を facade として活用。`REPEAT_KEY_ENABLE` を rules.mk で ON にすると QMK 標準動作が有効化される。Remap モジュールは `flags` ビットによってランタイムでの**機能 ON/OFF を上書き**できる。
 
@@ -981,7 +1406,7 @@ struct repeat_key_config {
 
 つまり「ビルド時に組み込み、ランタイムでマスク」という facade パターン。
 
-### 10.5 Auto Shift（module_id=0x18）
+### 13.5 Auto Shift（module_id=0x18）
 
 QMK Auto Shift。`get_auto_shifted_key` weak callback を Remap が実装。
 
@@ -996,7 +1421,7 @@ struct auto_shift_config {
 
 Auto Shift Retro モードは **Tier 3** とし、本仕様の対象外。
 
-### 10.6 Mouse Keys（module_id=0x19）
+### 13.6 Mouse Keys（module_id=0x19）
 
 QMK Mouse Keys の **MK_3_SPEED モード限定**でサポート。`mk_*` 設定値を動的反映。
 
@@ -1016,7 +1441,7 @@ struct mouse_keys_config {
 
 ACCELERATED モードは **Tier 3**。
 
-### 10.7 Per-Key Term（module_id=0x1A）
+### 13.7 Per-Key Term（module_id=0x1A）
 
 QMK の `get_tapping_term` weak callback を Remap が実装し、slot に合致する keycode のみ独自値を返す。
 
@@ -1042,9 +1467,244 @@ per_key_term_entry_t entries[REMAP_PER_KEY_TERM_MAX];  // default 8
 
 ---
 
-## 11. Process Record Integration
+## 14. Module: Backlight（module_id=0x20）
 
-### 11.1 QMK core patch（パターン D）
+単色 LED backlight の制御。VIA `id_qmk_backlight_channel` 相当の機能を Remap protocol で再設計。
+
+### 14.1 Sub-commands
+
+```
+0x01  GET_STATE   ()                                → [brightness:1, effect:1]
+0x02  SET_STATE   ([brightness:1, effect:1])        → []
+```
+
+### 14.2 詳細仕様
+
+#### `GET_STATE` (0x01)
+```
+Request (32B):
+  Byte 0:    0x20 (module_id)
+  Byte 1:    0x01 (sub_cmd)
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x20
+  Byte 1:    status
+  Byte 2:    brightness (uint8, 0-255)
+  Byte 3:    effect     (uint8, QMK backlight mode 値)
+  Byte 4-31: 0x00
+```
+
+#### `SET_STATE` (0x02)
+```
+Request (32B):
+  Byte 0:    0x20
+  Byte 1:    0x02
+  Byte 2:    brightness (uint8)
+  Byte 3:    effect     (uint8)
+  Byte 4-31: 0x00
+
+Response (32B):
+  Byte 0:    0x20
+  Byte 1:    status
+  Byte 2-31: 0x00
+```
+
+### 14.3 値域・実装方針
+
+- `brightness`：0-255（QMK 内部表現と同じ）
+- `effect`：QMK 内部 mode 値を**透過**（webapp が keyboard.json から有効 mode を知る）
+- SET 後の挙動：§3.5 RAM Cache + Save-on-Demand 準拠（RAM cache 即更新で視覚的即時反映、EEPROM commit は遅延）
+- 機能未対応キーボード（`BACKLIGHT_ENABLE = no`）：module 自体がリンクされない → webapp は `STATUS_UNKNOWN_MODULE` を受信して backlight UI を非表示にする
+
+---
+
+## 15. Module: RGB Light（module_id=0x21）
+
+RGB Light（WS2812 strip / SK6812 等の under-glow LED）の制御。VIA `id_qmk_rgblight_channel` 相当。
+
+### 15.1 Sub-commands
+
+```
+0x01  GET_STATE   ()  → [brightness:1, effect:1, effect_speed:1, hue:1, sat:1]
+0x02  SET_STATE   ([brightness:1, effect:1, effect_speed:1, hue:1, sat:1]) → []
+```
+
+### 15.2 詳細仕様
+
+#### `GET_STATE` (0x01)
+```
+Request (32B):
+  Byte 0:    0x21
+  Byte 1:    0x01
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x21
+  Byte 1:    status
+  Byte 2:    brightness    (uint8, 0-255)
+  Byte 3:    effect        (uint8, QMK rgblight mode 値)
+  Byte 4:    effect_speed  (uint8, 0-255)
+  Byte 5:    hue           (uint8, 0-255)
+  Byte 6:    sat           (uint8, 0-255)
+  Byte 7-31: 0x00
+```
+
+#### `SET_STATE` (0x02)
+```
+Request (32B):
+  Byte 0:    0x21
+  Byte 1:    0x02
+  Byte 2:    brightness
+  Byte 3:    effect
+  Byte 4:    effect_speed
+  Byte 5:    hue
+  Byte 6:    sat
+  Byte 7-31: 0x00
+
+Response (32B):
+  Byte 0:    0x21
+  Byte 1:    status
+  Byte 2-31: 0x00
+```
+
+### 15.3 値表現
+
+- 色は **HSV** で提供（QMK 内部 API `rgblight_sethsv()` と一致）
+- `brightness` は HSV の V (Value) と同義（`rgblight_get_val()` ≈ brightness）。webapp UI 用語「明るさ」と整合させるため `brightness` 名で公開
+- SET 後の挙動：§3.5 準拠
+- 機能未対応キーボード（`RGBLIGHT_ENABLE = no`）：module 不在で対応
+
+---
+
+## 16. Module: RGB Matrix（module_id=0x22）
+
+RGB Matrix（per-key RGB LED）の制御。VIA `id_qmk_rgb_matrix_channel` 相当。
+
+構造は **§15 RGB Light と完全同一**（5 値：brightness / effect / effect_speed / hue / sat）。
+
+### 16.1 Sub-commands
+
+```
+0x01  GET_STATE   ()  → [brightness:1, effect:1, effect_speed:1, hue:1, sat:1]
+0x02  SET_STATE   ([brightness:1, effect:1, effect_speed:1, hue:1, sat:1]) → []
+```
+
+### 16.2 詳細仕様
+
+`module_id` が `0x22` に変わるのみで、payload 構造・値域・実装方針は §15 と同一。RGB Matrix と RGB Light は QMK で同時に両方有効化するキーボードがあるため別 module として独立。
+
+機能未対応キーボード（`RGB_MATRIX_ENABLE = no`）：module 不在で対応。
+
+---
+
+## 17. Module: Audio（module_id=0x23）
+
+Audio（ビープ音・clicky）の制御。VIA `id_qmk_audio_channel` 相当。
+
+### 17.1 Sub-commands
+
+```
+0x01  GET_STATE   ()  → [audio_enable:1, clicky_enable:1]
+0x02  SET_STATE   ([audio_enable:1, clicky_enable:1]) → []
+```
+
+### 17.2 詳細仕様
+
+#### `GET_STATE` (0x01)
+```
+Request (32B):
+  Byte 0:    0x23
+  Byte 1:    0x01
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x23
+  Byte 1:    status
+  Byte 2:    audio_enable  (uint8, 0=disabled, 1=enabled)
+  Byte 3:    clicky_enable (uint8, 0=disabled, 1=enabled)
+  Byte 4-31: 0x00
+```
+
+#### `SET_STATE` (0x02)
+```
+Request (32B):
+  Byte 0:    0x23
+  Byte 1:    0x02
+  Byte 2:    audio_enable
+  Byte 3:    clicky_enable
+  Byte 4-31: 0x00
+
+Response (32B):
+  Byte 0:    0x23
+  Byte 1:    status
+  Byte 2-31: 0x00
+```
+
+### 17.3 値域・実装方針
+
+- bool 風 uint8（0=disabled, 1=enabled）。HID payload で bool 専用型は意味がないため uint8 で統一
+- SET 後の挙動：§3.5 準拠（RAM cache 即更新で聴覚的即時反映、EEPROM commit は遅延）
+- 機能未対応キーボード（`AUDIO_ENABLE = no`）：module 不在で対応
+
+---
+
+## 18. Module: LED Matrix（module_id=0x24）
+
+LED Matrix（単色 per-key LED）の制御。VIA `id_qmk_led_matrix_channel` 相当。
+
+### 18.1 Sub-commands
+
+```
+0x01  GET_STATE   ()  → [brightness:1, effect:1, effect_speed:1]
+0x02  SET_STATE   ([brightness:1, effect:1, effect_speed:1]) → []
+```
+
+### 18.2 詳細仕様
+
+#### `GET_STATE` (0x01)
+```
+Request (32B):
+  Byte 0:    0x24
+  Byte 1:    0x01
+  Byte 2-31: 0x00
+
+Response (32B):
+  Byte 0:    0x24
+  Byte 1:    status
+  Byte 2:    brightness    (uint8, 0-255)
+  Byte 3:    effect        (uint8, QMK led_matrix mode 値)
+  Byte 4:    effect_speed  (uint8, 0-255)
+  Byte 5-31: 0x00
+```
+
+#### `SET_STATE` (0x02)
+```
+Request (32B):
+  Byte 0:    0x24
+  Byte 1:    0x02
+  Byte 2:    brightness
+  Byte 3:    effect
+  Byte 4:    effect_speed
+  Byte 5-31: 0x00
+
+Response (32B):
+  Byte 0:    0x24
+  Byte 1:    status
+  Byte 2-31: 0x00
+```
+
+### 18.3 値域・実装方針
+
+- RGB Matrix から hue/sat を抜いた単色版（3 値）
+- SET 後の挙動：§3.5 準拠
+- 機能未対応キーボード（`LED_MATRIX_ENABLE = no`）：module 不在で対応
+
+---
+
+## 19. Process Record Integration
+
+### 19.1 QMK core patch（パターン D）
 
 Remap モジュールが**自動 dispatch**されるよう、`process_record_quantum` を改造する。
 
@@ -1067,7 +1727,7 @@ bool process_record_quantum(keyrecord_t *record) {
 2. 各 Remap モジュールへ順次 dispatch
 3. すべて通過したら `true` を返し、QMK 標準処理を継続
 
-### 11.2 `process_record_remap_user` weak callback
+### 19.2 `process_record_remap_user` weak callback
 
 Remap 機能を利用しつつ独自処理を介入させたいユーザー向けに、専用の weak callback を提供：
 
@@ -1092,7 +1752,7 @@ bool process_record_remap_user(uint16_t keycode, keyrecord_t *record) {
 }
 ```
 
-### 11.3 Pipeline Diagram
+### 19.3 Pipeline Diagram
 
 ```
 matrix scan
@@ -1118,7 +1778,7 @@ process_record_user                [keymap 製作者の領域、完全無改造]
 
 ⭐ キーボード製作者・keymap 製作者ともに **追加コードゼロ**で Remap 機能が動作する。
 
-### 11.4 `core_patches/` 台帳
+### 19.4 `core_patches/` 台帳
 
 QMK core への変更点は `core_patches/` 配下の README に台帳化する。各 patch ファイルは：
 - 対象ファイル（例: `quantum/quantum.c`）
@@ -1142,24 +1802,30 @@ core_patches/
       └ key_overrides[] を non-const + 外部参照ポインタ化
   005-process-record-remap-user-weak-callback.patch
       └ process_record_remap_user の weak callback 宣言を追加
+  006-raw-hid-receive-remap-dispatch.patch
+      └ raw_hid_receive を Remap dispatcher 一段化（VIA dispatcher 廃止）
+  007-eeconfig-retire.patch
+      └ QMK eeconfig (32B) を廃止し、Remap Header に置き換え
+      └ default_layer / keymap_config / unicode_mode は Header から読む
   ...
 ```
 
 QMK upstream merge 時は patch を再 apply、コンフリクト発生時は台帳と diff で判断する。
 
-**台帳メンテ規約**：本文（§7.1、§8.1、§9.1 等）で core patch に依存するコードを示す際、対応する `core_patches/NNN-*.patch` 番号を必ずコメント参照する。本文と台帳が乖離しないよう、追加 patch ごとに本仕様書を更新する。
+**台帳メンテ規約**：本文（§10.1、§11.1、§12.1 等）で core patch に依存するコードを示す際、対応する `core_patches/NNN-*.patch` 番号を必ずコメント参照する。本文と台帳が乖離しないよう、追加 patch ごとに本仕様書を更新する。
 
 ---
 
-## 12. Build-time Configuration
+## 20. Build-time Configuration
 
-### 12.1 `rules.mk` フィーチャーフラグ
+### 20.1 `rules.mk` フィーチャーフラグ
 
 各 Remap モジュールは個別にフィーチャーフラグで ON/OFF：
 
 ```makefile
 # Remap fork が提供するフラグ
 REMAP_ENABLE                   = no   # Remap 全体（必須、yes で残りが有効）
+REMAP_MACRO_ENABLE             = no
 REMAP_TAP_DANCE_LITE_ENABLE    = no
 REMAP_COMBO_LITE_ENABLE        = no
 REMAP_KEY_OVERRIDE_LITE_ENABLE = no
@@ -1174,7 +1840,9 @@ REMAP_PER_KEY_TERM_ENABLE      = no
 
 **デフォルト全 OFF（opt-in）**：キーボード製作者が必要なものだけ意識的に ON にする。EEPROM 容量の予測可能性を最優先。
 
-### 12.2 `keyboard.json` schema 拡張
+なお Lighting/Audio module（Backlight / RGB Light / RGB Matrix / Audio / LED Matrix）は QMK の標準フラグ（`BACKLIGHT_ENABLE` 等）に追従し、それぞれ ON のときに自動有効化される。
+
+### 20.2 `keyboard.json` schema 拡張
 
 `data/schemas/keyboard.jsonschema` に `remap` namespace を追加：
 
@@ -1188,6 +1856,10 @@ REMAP_PER_KEY_TERM_ENABLE      = no
     },
     "per_key_term": {
       "max_entries": 8
+    },
+    "macro": {
+      "count":         16,
+      "buffer_size":  177
     }
   }
 }
@@ -1198,7 +1870,7 @@ REMAP_PER_KEY_TERM_ENABLE      = no
 - 将来モジュール追加時の構造維持しやすい
 - ウェブ UI が namespace 単位でセクション構築しやすい
 
-### 12.3 QMK 機能依存の自動制御
+### 20.3 QMK 機能依存の自動制御
 
 Remap モジュール ON にしたら、対応 QMK 機能を**強制 ON**：
 
@@ -1221,7 +1893,7 @@ endif
 
 矛盾設定（例：`REMAP_TAP_DANCE_LITE_ENABLE = yes` かつ `TAP_DANCE_ENABLE = no`）の場合は**警告メッセージを出力しつつ Remap 設定優先でビルド継続**。
 
-### 12.4 デフォルト値（opt-in）
+### 20.4 デフォルト値（opt-in）
 
 すべてのモジュールデフォルト OFF。キーボード製作者は必要なモジュールのみ：
 
@@ -1233,28 +1905,32 @@ REMAP_COMBO_LITE_ENABLE     = yes
 # 他は OFF のまま
 ```
 
-### 12.5 メタデータ生成
+### 20.5 メタデータ生成
 
 Section 5.6 参照。`build_keyboard.mk` に組み込み、ビルド毎自動生成。
 
-### 12.6 EEPROM 容量計算
+### 20.6 EEPROM 容量計算
 
 Remap fork のビルドシステムが、有効モジュールから自動的に EEPROM 占有量を計算し、`Macro 枠が N B 残っています` 等のビルドログを出力する。容量超過時は警告 or エラー。
 
 ---
 
-## 13. Test Strategy
+## 21. Test Strategy
 
-### 13.1 C Unit Tests（googletest）
+### 21.1 C Unit Tests（googletest）
 
 **facade 部分のみ集中テスト**（QMK 既存機能はテスト対象外）。
 
 ```
 tests/remap_protocol/         # raw_hid parser、dispatcher
 tests/remap_slot_converter/   # custom_slot_t → QMK 構造体変換
-tests/remap_eeprom_io/        # EEPROM 抽象化層
+tests/remap_eeprom_io/        # EEPROM 抽象化層 + Remap Header 検証
 tests/remap_metadata/         # GET_BASIC レスポンス生成
-tests/remap_module_<name>/    # 各モジュール個別の handler ロジック
+tests/remap_keymap/           # Keymap module（GET/SET_KEYCODE、bulk transfer）
+tests/remap_macro/            # Macro module（buffer 操作、null-term 区切り）
+tests/remap_system/           # System module（matrix bitmap、bootloader_jump）
+tests/remap_lighting/         # Lighting/Audio 5 module の GET/SET_STATE
+tests/remap_module_<name>/    # 各 Tier 2 モジュール個別の handler ロジック
 ```
 
 実行：
@@ -1264,7 +1940,7 @@ make test:remap_slot_converter
 # ...
 ```
 
-### 13.2 Python Tests（pytest）
+### 21.2 Python Tests（pytest）
 
 QMK CLI 拡張のテスト：
 
@@ -1276,14 +1952,14 @@ lib/python/qmk/tests/test_remap_rules_mk.py      # rules.mk 自動制御
 
 実行：`qmk pytest`
 
-### 13.3 Mock 戦略
+### 21.3 Mock 戦略
 
 QMK の既存 mock 機構を流用 + 拡張：
 - **raw_hid_send / raw_hid_receive**：テスト用 stub（QMK 既存）
 - **EEPROM I/O**：in-memory buffer 方式（QMK 既存）
 - **QMK 公開 API**（`tap_dance_actions[]` 等）：unit テストでは mock し、Remap が正しく書き込むことのみ検証
 
-### 13.4 CI 統合
+### 21.4 CI 統合
 
 GitHub Actions の workflow を **branch 別に分離**：
 
@@ -1312,6 +1988,10 @@ jobs:
       - run: make test:remap_protocol
       - run: make test:remap_slot_converter
       - run: make test:remap_metadata
+      - run: make test:remap_keymap
+      - run: make test:remap_macro
+      - run: make test:remap_system
+      - run: make test:remap_lighting
   python_tests:
     runs-on: ubuntu-latest
     steps:
@@ -1335,7 +2015,7 @@ jobs:
 
 `master` branch の `ci.yml` は QMK 本家のものをそのまま継承し、Remap テストを入れない（upstream merge コンフリクト最小化）。
 
-### 13.5 Coverage 目標
+### 21.5 Coverage 目標
 
 明示的 % 目標は設けず、**重要パス（ホットパス）の完全網羅**を方針とする：
 
@@ -1343,11 +2023,12 @@ jobs:
 |-----------|---------------|
 | プロトコル parser | 100% |
 | slot 変換ロジック | 100% |
-| EEPROM I/O | 100% |
+| EEPROM I/O + Header 検証 | 100% |
+| §4.7 multi-packet transfer ロジック | 100% |
 | エラーハンドリング | 80%+ |
 | 初期化・終了処理 | 合理的範囲 |
 
-### 13.6 Manual QA Checklist
+### 21.6 Manual QA Checklist
 
 実機テストは自動化困難なため手動 QA リストで対応。リリース時の必須確認項目を spec に明記：
 
@@ -1356,7 +2037,12 @@ jobs:
 [ ] 代表 RP2040 ボード（KB2040 系）でビルド・フラッシュ成功
 [ ] 代表 STM32 ボード（Sofle 系）でビルド・フラッシュ成功
 [ ] ウェブアプリから probe 成功 → 全モジュール GET → SET → 動作確認
+[ ] Keymap module：GET/SET_KEYCODE → 反映確認、bulk transfer → 全 layer 取得
+[ ] Macro module：GET_INFO → SET_BUFFER → macro 再生確認
+[ ] System module：BOOTLOADER_JUMP → DFU 移行確認、EEPROM_RESET → 設定リセット確認
+[ ] Lighting/Audio：GET/SET_STATE → 視覚的・聴覚的反映確認
 [ ] EEPROM 容量超過時のビルド警告動作確認
+[ ] EEPROM 整合性ポリシー：magic 不一致時のゼロ初期化動作確認
 [ ] Tap Dance Lite：tap / hold / double_tap が期待通り動作
 [ ] Combo Lite：2-key 同時押し → 出力 keycode 動作確認
 [ ] Key Override Lite：trigger + mods → replacement keycode 動作確認
@@ -1367,30 +2053,31 @@ jobs:
 [ ] Auto Shift：長押し → shifted keycode 送信
 [ ] Mouse Keys：MK_3_SPEED モード動作確認
 [ ] Per-Key Term：個別 keycode の TAPPING_TERM 上書き動作確認
-[ ] VIA fallback：Remap 非対応キーボードでウェブ接続時に VIA 互換動作
 [ ] WSL + VSCode index.lock 競合：retry ループで回復
 ```
 
+なお「VIA-only キーボードでの VIA fallback 動作」は **Remap Webapp 側の責務**として webapp spec に移管された（Remap Firmware 側 QA 対象外）。
+
 ---
 
-## 14. Risk Register
+## 22. Risk Register
 
 8 つのリスクを優先度付きで列挙。
 
 | ID | リスク | 確度 | 影響 | 優先度 | 緩和策 |
 |----|--------|------|------|--------|--------|
 | **R1** | Remap fork のメンテコスト（QMK upstream 追従、core patch 維持）| 高 | 中 | 🔴 高 | core patch 最小限化、`core_patches/` 台帳整備、定期 sync スケジュール（四半期） |
-| **R2** | ATmega32U4 EEPROM 容量制約（全モジュール ON で 863B、マクロ枠 161B）| 中 | 高 | 🔴 高 | rules.mk opt-in 規約、ウェブ UI で「現在の EEPROM 使用量」可視化 |
-| **R3** | 既存 VIA-only キーボードの移行コスト（1100+ keyboards）| 高 | 中 | 🔴 高 | 移行ガイド整備、優先度の高いキーボード（Lily58 / Corne 等）から段階対応 |
+| **R2** | ATmega32U4 EEPROM 容量制約（全モジュール ON で 844B、マクロ枠 180B）| 中 | 高 | 🔴 高 | rules.mk opt-in 規約、ウェブ UI で「現在の EEPROM 使用量」可視化 |
+| **R3** | 既存 VIA-only キーボードの扱い（1100+ keyboards）| 低 | 低 | 🟢 低 | Webapp が VIA protocol を継続サポートするため、ユーザーは何も変えずに使い続けられる。Remap firmware 化はキーボード単位でオプトイン |
 | **R4** | デバッグ困難（QMK 起因 / Remap 起因 / core patch 起因の切り分け）| 中 | 中 | 🟡 中 | Remap 専用ログ機構、core patch 明示的ラベル付け |
 | **R5** | 実機テスト自動化の困難 | 中 | 中 | 🟡 中 | QA リスト最小ホットパス限定、コミュニティ協力型ベータテスト |
-| **R6** | ウェブアプリ機能パリティ（VIA との同等性確認）| 低 | 高 | 🟡 中 | 機能比較表を spec doc に維持、回帰テスト実施 |
+| **R6** | ウェブアプリ機能パリティ（VIA 機能カバレッジ）| 低 | 高 | 🟡 中 | VIA 全機能 → Remap protocol 対応の表を本仕様（§6-§8、§14-§18）に維持、回帰テスト実施 |
 | **R7** | プロトコル進化時の互換性 | 低 | 中 | 🟢 低 | probe で早期 version 判定、incompatible なら分岐提示 |
-| **R8** | HID raw 32B 制約による拡張性 | 低 | 低 | 🟢 低 | ストリーム送信機構（GET_xxx_BEGIN/CONTINUE/END）を必要時追加 |
+| **R8** | HID raw 32B 制約による拡張性 | 低 | 低 | 🟢 低 | §4.7 stateless offset-based multi-packet transfer protocol で対応済み（spec で正式定義） |
 
 ---
 
-## 15. Open Items
+## 23. Open Items
 
 実装フェーズで詰める細部：
 
@@ -1407,14 +2094,18 @@ jobs:
 11. **マルチ JIS / EN keymap 切替対応**：QMK の language layer と Remap layout options の関係
 12. **Bluetooth / Wireless キーボード対応**：BMP 等との互換性方針
 13. **EEPROM 容量超過時のフォールバック**：ビルド時警告 / エラーの具体閾値
+14. **Encoder keycode の EEPROM 配置詳細**：Keymap region 内 or 別領域、サイズ計算式
+15. **Remap Header の旧 QMK 互換フィールド粒度**：`steno_mode` / `handedness` 等を Header に追加するか、別領域で対応するか
+16. **SET 系の chunked transfer**：現状 `Keymap.SET_BUFFER` / `Macro.SET_BUFFER` のみ。将来他 SET でも必要になった場合の対称適用ポリシー
+17. **§4.7 chunk_len = 0 の扱い**：要求 offset が `total_bytes` 以上の場合は `chunk_len = 0` を返すかエラーか
 
 ---
 
-## 16. References
+## 24. References
 
 - 関連 spec: `2026-04-29-remap-webapp-integration-design.md`（ウェブアプリ側）
 - QMK Firmware: <https://github.com/qmk/qmk_firmware>
-- VIA Firmware Protocol: <https://www.caniusevia.com/docs/specification>
+- VIA Firmware Protocol（参考、Remap は完全分離）: <https://www.caniusevia.com/docs/specification>
 - Remap web app: <https://remap-keys.app/>
 - WebHID API: <https://developer.mozilla.org/en-US/docs/Web/API/WebHID_API>
 
@@ -1433,6 +2124,18 @@ jobs:
 |-----------|-------|
 | Request   | `[module_id, sub_cmd, payload[0..29]]` |
 | Response  | `[module_id, status, payload[0..29]]` |
+
+### Multi-packet Transfer (§4.7、GET 系)
+| Direction | Bytes |
+|-----------|-------|
+| Request   | `[module_id, sub_cmd, offset_lo, offset_hi, 0x00 ...]` |
+| Response  | `[module_id, status, total_lo, total_hi, off_lo, off_hi, chunk_len, data[0..25]]` |
+
+### Multi-packet Transfer (§4.7、SET 系)
+| Direction | Bytes |
+|-----------|-------|
+| Request   | `[module_id, sub_cmd, offset_lo, offset_hi, chunk_len, data[0..24]]` |
+| Response  | `[module_id, status, 0x00 ...]` |
 
 ### Status Codes
 | Hex | Name | Meaning |
@@ -1455,33 +2158,44 @@ ATmega32U4（1 KB EEPROM）、典型 60% キーボード、全モジュール ON
 ```
 Address  Size  Region
 ─────────────────────────────────────────────
-0x000   32 B  QMK eeconfig
-0x020  560 B  dynamic_keymap (4 layer × 70 key × 2B)
-0x250   20 B  Remap meta region
-0x264  192 B  Remap slot table (TD 64 + Combo 64 + OVR 64)
-0x324    4 B  Caps Word config
-0x328    4 B  One Shot config
-0x32C    4 B  Tri Layer config
-0x330    1 B  Repeat Key flags
-0x331    4 B  Auto Shift config
-0x335    8 B  Mouse Keys config
-0x33D   32 B  Per-Key Term table
-0x35D    2 B  Combo TERM
-0x35F  161 B  Macro region
+0x000   16 B  Remap Header (magic / protocol_version / layout_options /
+              default_layer / keymap_config / unicode_mode / reserved)
+0x010  560 B  Keymap Region (Keymap module 管理、4 layer × 70 key × 2B)
+0x240  192 B  Slot Table (TD 64 + Combo 64 + OVR 64)
+0x300    4 B  Caps Word config
+0x304    4 B  One Shot config
+0x308    4 B  Tri Layer config
+0x30C    1 B  Repeat Key flags
+0x30D    4 B  Auto Shift config
+0x311    8 B  Mouse Keys config
+0x319   32 B  Per-Key Term table
+0x339    2 B  Combo TERM
+0x33B    2 B  Backlight state
+0x33D    5 B  RGB Light state
+0x342    5 B  RGB Matrix state
+0x347    3 B  LED Matrix state
+0x34A    2 B  Audio state
+0x34C  180 B  Macro Region (keyboard.json で固定、ATmega32U4 残量)
 0x3FF        (end)
 ```
+
+VIA eeconfig (32B) を廃止したことで、旧 spec 試算（Macro 枠 161B）から **+19B** 余裕が生まれている（Header 縮小 +36B − Lighting/Audio 追加 17B = +19B 純増）。実際の Macro 枠は keyboard.json で確定する。
 
 ---
 
 ## Appendix C: Module ID & Keycode Range Reservations
 
-> **注**：本表は §4.4 / §6.3 / §7.5 / §8.4 / §10.x 等で個別に定義された ID・帯域の**要約**である。正本は本文側であり、矛盾があれば本文側を優先する。仕様変更時は本文と本 Appendix の両方を同時更新すること。
+> **注**：本表は §4.4 / §6 / §7 / §8 / §9.3 / §10.5 / §11.4 / §13.x / §14-§18 等で個別に定義された ID・帯域の**要約**である。正本は本文側であり、矛盾があれば本文側を優先する。仕様変更時は本文と本 Appendix の両方を同時更新すること。
 
 ### Module IDs
 ```
 0x00         (reserved)
 0x01         Metadata
-0x02-0x0F    (reserved for future global modules)
+0x02         Keymap
+0x03         Macro
+0x04         (reserved)
+0x05         System
+0x06-0x0F    (reserved for future global modules)
 0x10         Slot Table
 0x11         (reserved)
 0x12         Combo (補完設定)
@@ -1493,7 +2207,13 @@ Address  Size  Region
 0x18         Auto Shift
 0x19         Mouse Keys
 0x1A         Per-Key Term
-0x1B-0xFD    (reserved for future modules)
+0x1B-0x1F    (reserved for Tier 2 拡張)
+0x20         Backlight
+0x21         RGB Light
+0x22         RGB Matrix
+0x23         Audio
+0x24         LED Matrix
+0x25-0xFD    (reserved for future modules)
 0xFE         Probe handshake (special)
 0xFF         (reserved)
 ```
@@ -1520,10 +2240,10 @@ Address  Size  Region
 | **module_id** | Remap protocol 上の機能ブロック識別子（1B） |
 | **sub_cmd** | module 内のオペレーション識別子（1B） |
 | **slot** | Tap Dance / Combo / Override で共通利用される 8B 動的設定エントリ |
-| **probe** | 接続時に Remap firmware か VIA firmware かを判別する handshake |
+| **probe** | 接続時に Remap firmware か否かを判別する handshake |
 | **core patch** | QMK upstream のソースに対する Remap 固有の変更 |
-| **eeconfig** | QMK の EEPROM 内設定領域（バイト 0-31）|
-| **dynamic_keymap** | VIA 互換のランタイム keymap 変更領域 |
+| **Remap Header** | EEPROM 先頭 16B に配置する Remap 固有の制御領域（VIA eeconfig の置き換え） |
+| **Multi-packet Transfer** | §4.7 で定義する stateless offset-based の chunked データ転送プロトコル |
 | **PROGMEM** | AVR の FLASH 領域配置指定（プログラムメモリ） |
 | **Q6.2 fixed-point** | 6 整数 + 2 小数ビットの固定小数点表現（KLE 座標用） |
 
@@ -1535,3 +2255,4 @@ Address  Size  Region
 |------|--------|
 | 2026-04-29 | 初版（Section 1-4 確定） |
 | 2026-05-01 | Section 5-15 追加。Section 7 で根本的設計転換（独自実装 → QMK facade）。 |
+| 2026-05-02 | VIA protocol 完全置換決定に伴う大改修。§4.7 multi-packet transfer 新設、§3.3-§3.6 EEPROM Layout 再構築（VIA eeconfig 廃止 → Remap Header 統合）、§5.1 sub_cmd 再採番（11→7 個）、§5.4 GET_ENCODER_INFO 廃止。新 module 群追加：Keymap (§6)、Macro (§7)、System (§8)、Backlight/RGB Light/RGB Matrix/Audio/LED Matrix (§14-§18)。既存 §6-§16 を §9-§24 に renumbering。R3 / R8 再評価。Open Items に encoder 配置・SET chunked policy 等を追加。 |
