@@ -223,7 +223,7 @@ ATmega32U4（1 KB EEPROM）想定の典型レイアウト（VIA eeconfig 廃止 
        │ LED Matrix state     │   3 B   (#ifdef LED_MATRIX_ENABLE)
        │ Audio state          │   2 B   (#ifdef AUDIO_ENABLE)
 0x34C ─┼─────────────────────┤
-       │ Macro Region         │ ~180 B  (残り全部、keyboard.json で固定)
+       │ Macro Region         │ ~180 B  (残り全部、remap.json で固定)
 0x3FF ─┴─────────────────────┘
 ```
 
@@ -241,7 +241,7 @@ Macro Region:     180 B  (残り)
 合計:            1024 B  ✅ ピッタリ
 ```
 
-**注**：slot 配分を `keyboard.json` で変更すると slot table サイズと Macro 枠が連動して伸縮する。
+**注**：slot 配分を `remap.json` で変更すると slot table サイズと Macro 枠が連動して伸縮する。
 たとえば slot 合計を論理上限の 32 まで拡張すると slot table は 256 B（+64 B）となり、
 Macro 枠は 116 B（−64 B）に縮小される。逆に slot 配分を絞れば Macro 枠を増やせる。
 
@@ -272,7 +272,7 @@ typedef struct __attribute__((packed)) {
 | `protocol_version` | 整数連番。version mismatch 検出（§4.2 probe と必ず同値） |
 | `default_layer` | QMK 起動時のデフォルト layer（互換維持） |
 | `keymap_config` | QMK keymap_config bit field（swap caps/escape, autocorrect 等） |
-| `layout_options` | レイアウトオプション 32bit。Metadata module の GET/SET_LAYOUT_OPTIONS で読み書き |
+| `layout_options` | レイアウトオプション 32bit。Metadata module の GET/SET_LAYOUT_OPTIONS_STATE で読み書き |
 | `unicode_mode` | QMK unicode 入力モード（互換維持） |
 | `reserved_a` / `reserved_tail` | 将来拡張用 |
 
@@ -282,7 +282,7 @@ typedef struct __attribute__((packed)) {
 - 旧 `rgblight_config` → RGB Light module 領域へ移動
 - 旧 `audio_config` → Audio module 領域へ移動
 - 旧 `keyboard_specific[15]`（VIA layout_options 32-35B 含む）→ Header `layout_options` に統合、それ以外は捨てる
-- 旧 `steno_mode`、`handedness` → 必要なら keyboard.json or 別領域で対応（Open Items 参照）
+- 旧 `steno_mode`、`handedness` → 必要なら `remap.json` の独自フィールド or 別領域で対応（Open Items 参照）
 
 ### 3.5 RAM Cache + Save-on-Demand
 
@@ -354,7 +354,7 @@ uint8_t remap_slot_table_commit(void) {
 #define REMAP_OFFSET_SLOT_TABLE   (REMAP_OFFSET_KEYMAP + REMAP_SIZE_KEYMAP)
 #define REMAP_SIZE_SLOT_TABLE \
     ((REMAP_TD_SLOT_COUNT + REMAP_COMBO_SLOT_COUNT + REMAP_OVR_SLOT_COUNT) * 8)
-// 論理上限は 32 slots × 8B = 256B（keyboard.json の合計 ≤ 32 制約）。
+// 論理上限は 32 slots × 8B = 256B（remap.json の合計 ≤ 32 制約）。
 // 実サイズは TD/Combo/OVR の各 SLOT_COUNT に応じてビルド時決定される。
 
 #define REMAP_OFFSET_CAPS_WORD    (REMAP_OFFSET_SLOT_TABLE + REMAP_SIZE_SLOT_TABLE)
@@ -391,10 +391,198 @@ uint8_t remap_slot_table_commit(void) {
 // ... RGB Matrix / LED Matrix / Audio も同様
 
 #define REMAP_OFFSET_MACRO        (REMAP_OFFSET_AUDIO + REMAP_SIZE_AUDIO)
-#define REMAP_SIZE_MACRO          (REMAP_MACRO_BUFFER_SIZE)  // keyboard.json で固定
+#define REMAP_SIZE_MACRO          (REMAP_MACRO_BUFFER_SIZE)  // remap.json で固定
 ```
 
 無効化されたモジュールは 0 バイト消費。マクロ枠を最大化できる。
+
+### 3.7 `remap.json` Source Format
+
+メタデータ生成の Single Source of Truth（SoT）として、各キーボードに `remap.json` を 1 個配置する。`keyboard.json` は `remap.json` から **ビルド時に派生生成** される（§5.6）。
+
+#### 3.7.1 Position in Build Pipeline
+
+```
+remap.json （設計者が編集する SoT）
+    │
+    ▼ qmk generate-from-remap
+    │
+    ├── keyboard.json （QMK ビルド入力。VCS 管理外）
+    └── build/remap_metadata.c （Remap メタデータ。VCS 管理外）
+            │
+            ▼ qmk compile
+            │
+            └── ファームウェア（keyboard.json + remap_metadata.c を含む）
+                    │
+                    ▼ USB HID
+                    │
+                    └── Remap webapp（§4 wire protocol で取得）
+```
+
+- 設計者は `remap.json` のみ編集する
+- `keyboard.json` は触らない（生成物）
+- ビルドパイプラインが両方の生成物（QMK 用 / Remap メタデータ用）を 1 ソースから出力
+
+#### 3.7.2 ファイル名と配置
+
+| 項目 | 値 |
+|---|---|
+| ファイル名 | `remap.json` |
+| 配置 | `keyboards/<kb>/remap.json` |
+| エンコーディング | UTF-8、JSON5 ではなく標準 JSON |
+
+`keyboard.json` と同じディレクトリに配置することで、QMK の既存ディレクトリ規約を破らない。
+
+#### 3.7.3 VCS Strategy
+
+- **`remap.json` は git にコミットする**（SoT なので）
+- **`keyboard.json` は git にコミットしない**（生成物）
+  - `.gitignore` に `keyboards/*/keyboard.json` を追加
+  - 例外：QMK upstream から merge した既存 `keyboard.json` の扱いについては §3.7.8 Migration Tool を参照
+
+理由：両方コミットすると DRY 違反になり、片方だけ更新された場合の整合性が保証できなくなる。`remap.json` を SoT に固定し、`keyboard.json` は再生成可能なビルド成果物として扱う。
+
+#### 3.7.4 Hybrid Structure（Option C）
+
+`remap.json` のトップレベルは 3 つの起源を持つフィールドをハイブリッドで保持する：
+
+```jsonc
+{
+  // === QMK keyboard.json 派生（トップレベルにそのまま展開） ===
+  "manufacturer": "remap-keys",
+  "keyboard_name": "Lunakey Pico",
+  "maintainer": "yoichiro",
+  "usb": { "vid": "0xFEED", "pid": "0x0000", "device_version": "0.0.1" },
+  "matrix_pins": { "rows": [...], "cols": [...] },
+  "diode_direction": "COL2ROW",
+  "features": { "encoder": true, "rgblight": true, "extrakey": true },
+  "rgblight": { "led_count": 12, "animations": {...} },
+  "encoder": { "rotary": [{"pin_a": "GP10", "pin_b": "GP11"}] },
+  "dynamic_keymap": { "layer_count": 4 },
+
+  // === VIA info.json 派生（トップレベルに展開、ただし `layouts` 内構造化） ===
+  "layouts": {
+    "options": [
+      { "type": "boolean", "label": "Bool Option" },
+      { "type": "enum",    "label": "Enum Header", "choices": ["ch0", "ch1", "ch2"] }
+    ],
+    "keymap": [
+      [{"x": 0, "y": 0}, "0,0", "0,1", "\n\n\n\n\n\n\n\n\ne0"],
+      [{"y": 1}, "1,0", "1,1"]
+    ]
+  },
+
+  // === Remap 独自（`remap` namespace に隔離） ===
+  "remap": {
+    "schema_version": 1,
+    "slots": {
+      "tap_dance":    8,
+      "combo":        8,
+      "key_override": 8
+    },
+    "per_key_term": { "max_entries": 8 },
+    "macro":        { "count": 16, "buffer_size": 177 }
+  }
+}
+```
+
+**設計原則**：
+- **QMK 由来フィールドはトップレベルそのまま**：QMK の既存スキーマと同形式を保ち、生成された `keyboard.json` への変換を最小ロジックで済ませる
+- **VIA 由来フィールドもトップレベル `layouts` 配下**：webapp 既存パーサがそのまま読める KLE 構造
+- **Remap 独自は `remap.*` で隔離**：QMK / VIA とのフィールド衝突を回避、将来の拡張地点を明確化
+
+#### 3.7.5 `layouts.options` の構造
+
+VIA info.json の `layout_options` メタデータ（boolean / enum）は **構造化された配列** として宣言する：
+
+```jsonc
+"layouts": {
+  "options": [
+    {
+      "type":  "boolean",
+      "label": "Split halves swap"
+    },
+    {
+      "type":    "enum",
+      "label":   "Bottom row layout",
+      "choices": ["ANSI", "ISO", "JIS"]
+    }
+  ]
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | `"boolean"` \| `"enum"` | オプションの種別 |
+| `label` | string | UI 表示用ラベル |
+| `choices` | string[] | enum 限定。選択肢ラベル配列 |
+
+`layouts.keymap` 内の各キーは KLE label の slot 3（`"0,1"` 形式）でこの options 配列のインデックスと選択値を参照する。
+
+#### 3.7.6 `layouts.keymap` のエンコーダ表現
+
+VIA passthrough。KLE label の `\n` 区切り slot 9 に `e<n>` 形式でエンコーダ ID を埋め込む：
+
+```jsonc
+"keymap": [
+  ["0,0", "0,1", "\n\n\n\n\n\n\n\n\ne0"]   // 3 番目のキーが encoder 0
+]
+```
+
+| 表現形 | 意味 |
+|---|---|
+| `\n` × 9 + `e0` | 回転のみエンコーダ（matrix 位置なし） |
+| `0,1\n` × 8 + `e0` | 押し込み付きエンコーダ（matrix 位置あり） |
+| `e0` 単独（`a=3` or `a=7`） | コンパクト表記 |
+
+CW / CCW の区別は KLE 上には現れない。webapp が wire protocol（§6）で `clockwise: true/false` フラグ付きで個別取得する。
+
+#### 3.7.7 v1 Scope
+
+**目標**：既存 Remap UI が提供する全機能を、Remap への事前キーボード登録なしで利用可能にする（self-describing keyboard / plug-and-play）。
+
+**v1 でカバーする機能**（Remap UI 現行サポート）：
+
+| ID | 機能 |
+|---|---|
+| A1 | Layer 切替（dynamic_keymap） |
+| A2 | Keycode 編集 |
+| A3 | Macro 編集 |
+| A6 | Reset 操作 |
+| B1 | Layout（KLE） |
+| B2 | Layout Options |
+| C1 | RGB Light（標準アニメーション） |
+| C3 | Backlight |
+| D1 | Encoder（CW/CCW keycode） |
+| D2 | Layout Options（再掲、構造化） |
+| D3 | KLE inline color（`c` 属性のみ） |
+| E1 | Basic export/import |
+
+**v1 範囲外**：
+
+- Tap Dance（A4）、Combo（A5）— Remap UI 現行未対応
+- RGB Matrix UI（C2）、Custom underglow / matrix（C4, C5）— Remap UI 現行未対応
+- Centralized palette（lighting_extension）— Remap UI 現行未対応
+- Advanced export/import（E2）— Remap UI 現行未対応
+
+これらは spec 内の §10〜§19 で **wire protocol レベルでは予約済み**。webapp 側の対応を待つ。
+
+#### 3.7.8 Migration Tool
+
+既存の `keyboards/<kb>/keyboard.json` + Firestore 登録 info.json を入力に `remap.json` を生成する **個別キーボード変換ツール** を提供する：
+
+```bash
+qmk migrate-to-remap --keyboard <kb> [--info-json <path>] [--output keyboards/<kb>/remap.json]
+```
+
+**設計方針**：
+
+- **一括変換しない**：全 1100+ キーボードを機械的に変換せず、設計者またはメンテナが個別キーボード単位で実行
+- **冪等性**：同じ入力からは同じ出力（タイムスタンプ等を含めない）
+- **dry-run 対応**：`--dry-run` で diff のみ表示
+- **既存 `remap.json` 保護**：上書き時は確認プロンプト or `--force` 必須
+
+キーボード設計者が自発的に Remap 対応を有効化するためのオプトインツール。一括移行スクリプトは bash ループで個別ツールを呼び出すだけで実装できるため、別途用意しない。
 
 ---
 
@@ -631,7 +819,7 @@ while True:
 
 本プロトコルは以下の sub_cmd で使用される：
 
-- `Metadata.GET_STRING_TABLE`、`GET_LAYOUTS`、`GET_LED_POSITIONS`、`GET_CUSTOM_KEYCODES`
+- `Metadata.GET_STRING_TABLE`、`GET_LAYOUTS`、`GET_LED_POSITIONS`、`GET_CUSTOM_KEYCODES`、`GET_LAYOUT_OPTIONS_META`
 - `Keymap.GET_BUFFER`、`SET_BUFFER`
 - `Macro.GET_BUFFER`、`SET_BUFFER`
 
@@ -651,8 +839,9 @@ VIA JSON 撤廃の中核。キーボードのあらゆるメタデータを動�
 0x03  GET_LAYOUTS                   (KLE レイアウト取得、§4.7 chunked)
 0x04  GET_LED_POSITIONS             (LED 位置取得、§4.7 chunked)
 0x05  GET_CUSTOM_KEYCODES           (カスタムキーコード取得、§4.7 chunked)
-0x06  GET_LAYOUT_OPTIONS            (レイアウトオプション 4B 取得)
-0x07  SET_LAYOUT_OPTIONS            (レイアウトオプション 4B 設定)
+0x06  GET_LAYOUT_OPTIONS_STATE      (layout options 状態 4B 取得)
+0x07  SET_LAYOUT_OPTIONS_STATE      (layout options 状態 4B 設定)
+0x08  GET_LAYOUT_OPTIONS_META       (layout options メタデータ取得、§4.7 chunked)
 ```
 
 旧 spec の `GET_xxx_BEGIN` / `GET_xxx_CONTINUE` ペアは §4.7 stateless offset-based に統合され、各機能 1 sub_cmd に削減された。旧 `GET_ENCODER_INFO` は webapp 側で利用機会が無いため廃止（encoder の数は §5.2 `num_encoders` で取得、keymap は Keymap module で取得）。
@@ -670,7 +859,7 @@ typedef struct __attribute__((packed)) {
     /* Identity */
     uint16_t vendor_id;              // 2B
     uint16_t product_id;             // 2B
-    uint16_t firmware_version;       // 2B（keyboard.json 由来、表示用）
+    uint16_t firmware_version;       // 2B（remap.json 由来、表示用）
 
     /* Hardware */
     uint8_t  matrix_rows;            // 1B
@@ -719,30 +908,116 @@ HID 30B payload に対して struct 26B → 余り 4B。すべて `0x00` zero-fi
 
 #### KLE Layout の表現
 
-各キー位置は **Q6.2 固定小数点**（`uint8_t × 0.25u`、範囲 0-63.75u）でエンコード：
+各キー位置は **Q6.2 固定小数点**（`uint8_t × 0.25u`、範囲 0-63.75u）で幾何情報をエンコード。1 構造体に幾何 + 視覚属性 + 関連付けを統合保持する：
 
 ```c
 typedef struct __attribute__((packed)) {
-    uint8_t  matrix_row;    // 1B
-    uint8_t  matrix_col;    // 1B
-    uint8_t  x_q6_2;        // 1B：x 座標（0.25u 単位）
-    uint8_t  y_q6_2;        // 1B：y 座標
-    uint8_t  w_q6_2;        // 1B：幅
-    uint8_t  h_q6_2;        // 1B：高さ
-    uint8_t  flags;         // 1B：bit0=is_decal、bit1-7=reserved
-    uint8_t  rotation;      // 1B：将来拡張用、現状 0 固定
-} remap_layout_key_t;       // 8B/key
+    /* Matrix 位置（非 matrix キー = 0xFF, 0xFF）*/
+    uint8_t  matrix_row;        // 1B
+    uint8_t  matrix_col;        // 1B
+
+    /* 幾何（Q6.2 固定小数点、0.25u 単位）*/
+    uint8_t  x_q6_2;            // 1B
+    uint8_t  y_q6_2;            // 1B
+    uint8_t  w_q6_2;            // 1B
+    uint8_t  h_q6_2;            // 1B
+
+    /* 関連付け */
+    uint8_t  encoder_id;        // 1B：エンコーダ番号（0xFF=非エンコーダ）
+    uint8_t  layout_opt_idx;    // 1B：所属する layout option index（0xFF=該当なし）
+    uint8_t  layout_opt_val;    // 1B：option 内での選択値（boolean=0/1, enum=index）
+    uint8_t  flags;             // 1B：bit0=is_decal、bit1-7=reserved
+
+    /* 視覚 */
+    uint8_t  color_r;           // 1B：KLE `c` 属性 RGB（未指定時 0x00）
+    uint8_t  color_g;           // 1B
+    uint8_t  color_b;           // 1B
+
+    /* 回転 */
+    uint16_t rotation_q8_8;     // 2B：Q8.8 度（0.00390625° 単位、-180.0〜+179.996）
+    uint8_t  reserved;          // 1B：将来拡張用
+} remap_layout_key_t;           // 16B/key
 ```
 
-8 B/key × ~70 key（典型 60%）= ~560 B → 1 パケット 26B 内に 3 key 収まる → ~24 パケットで全 layout 取得（§4.7 chunked）。
+**フィールド設計の根拠**：
+
+| フィールド | 由来 | センチネル/初期値 |
+|---|---|---|
+| `matrix_row`, `matrix_col` | KLE label slot 0（`"row,col"`）or slot 3（layout option 付きキー） | 非 matrix キーは `0xFF, 0xFF` |
+| `x/y/w/h_q6_2` | KLE 標準座標 | 0 始まり |
+| `encoder_id` | KLE label slot 9（`e<n>` パターン）or `a=3/7` 単独 label | 非エンコーダは `0xFF` |
+| `layout_opt_idx`, `layout_opt_val` | KLE label slot 3 経由の layout option 関連付け | 該当なしは idx=`0xFF` |
+| `flags` | KLE `d` 属性（decal）等 | 0 |
+| `color_r/g/b` | KLE `c` 属性 | 未指定時 0x000000（webapp 側でデフォルト色適用） |
+| `rotation_q8_8` | KLE `r` 属性（Q8.8 度） | 0 |
+
+**サイズ試算**：16 B/key × ~70 key（典型 60%）= ~1120 B FLASH。1 パケット 26B payload 内に 1 key 収まる（パディングあり）→ ~70 パケットで全 layout 取得（§4.7 chunked）。
+
+#### LED Positions
+
+RGB matrix / LED matrix が ON の場合のみ。同様の固定長構造で取得（§4.7 chunked）。`remap_led_position_t` の正式定義は Open Items 参照。
 
 #### LED Positions
 
 RGB matrix / LED matrix が ON の場合のみ。同様に 8B/LED 構造で取得（§4.7 chunked）。`remap_led_position_t` の正式定義は Open Items 参照。
 
-### 5.5 Layout Options（GET / SET）
+### 5.5 Layout Options（State / Metadata）
 
-#### GET_LAYOUT_OPTIONS (0x06)
+Layout options は 2 種類のデータ層を持つ：
+
+| 層 | 内容 | 格納場所 | sub_cmd |
+|---|---|---|---|
+| **Metadata** | option 定義（type, label, choices）— 静的、設計時固定 | Flash（PROGMEM、`remap.json` 由来） | `GET_LAYOUT_OPTIONS_META` (0x08) |
+| **State** | 各 option の現在の選択値 — 動的、ユーザー操作で変化 | EEPROM（Remap Header §3.4） | `GET_LAYOUT_OPTIONS_STATE` (0x06) / `SET_LAYOUT_OPTIONS_STATE` (0x07) |
+
+#### 5.5.1 `remap_layout_option_t` 構造（4B/option、PROGMEM）
+
+```c
+typedef struct __attribute__((packed)) {
+    uint8_t  type;                  // 0x00=boolean, 0x01=enum
+    uint8_t  label_str_idx;         // String Table の index（label 文字列）
+    uint8_t  choice_count;          // boolean=0、enum=N（最大 16）
+    uint8_t  choices_str_idx_base;  // String Table の連続 N 個（base, base+1, ..., base+N-1）
+} remap_layout_option_t;            // 4B/option
+```
+
+**設計根拠**：
+- 文字列はすべて String Table（§5.3）経由で indirect → option メタデータ自体は固定長
+- `enum` の choices は String Table の **連続範囲** に配置することで `choices_str_idx_base + i` で参照可能（生成器側の責務）
+- 4B × 最大 32 options = 最大 128 B FLASH
+
+**例**（remap.json `layouts.options` → メタデータ展開）：
+
+```jsonc
+// remap.json
+"options": [
+  { "type": "boolean", "label": "Split halves swap" },
+  { "type": "enum",    "label": "Bottom row", "choices": ["ANSI", "ISO", "JIS"] }
+]
+```
+
+```c
+// remap_metadata.c (auto-generated)
+const char remap_str_5[] PROGMEM = "Split halves swap";
+const char remap_str_6[] PROGMEM = "Bottom row";
+const char remap_str_7[] PROGMEM = "ANSI";
+const char remap_str_8[] PROGMEM = "ISO";
+const char remap_str_9[] PROGMEM = "JIS";
+
+const remap_layout_option_t remap_layout_options[] PROGMEM = {
+    { .type = 0x00, .label_str_idx = 5, .choice_count = 0, .choices_str_idx_base = 0 },
+    { .type = 0x01, .label_str_idx = 6, .choice_count = 3, .choices_str_idx_base = 7 },
+};
+```
+
+#### 5.5.2 `GET_LAYOUT_OPTIONS_META` (0x08)
+
+§4.7 chunked で全 option メタデータを取得。`total_bytes = sizeof(remap_layout_option_t) × num_options = 4 × num_options`。
+
+webapp は §5.2 の `remap_meta_basic_t` から option 数を取得済み（→ Open Items：`num_layout_options` フィールドを `remap_meta_basic_t` に追加するか検討）して、必要 byte 数を chunked 取得。受信後は String Table（§5.3）の対応エントリを参照して label / choices 文字列を解決する。
+
+#### 5.5.3 `GET_LAYOUT_OPTIONS_STATE` (0x06)
+
 ```
 Request (32B):
   Byte 0:    0x01 (module_id)
@@ -752,16 +1027,17 @@ Request (32B):
 Response (32B):
   Byte 0:    0x01
   Byte 1:    status
-  Byte 2-5:  layout_options (uint32 LE、bit field)
+  Byte 2-5:  layout_options_state (uint32 LE、bit field)
   Byte 6-31: 0x00
 ```
 
-#### SET_LAYOUT_OPTIONS (0x07)
+#### 5.5.4 `SET_LAYOUT_OPTIONS_STATE` (0x07)
+
 ```
 Request (32B):
   Byte 0:    0x01
   Byte 1:    0x07
-  Byte 2-5:  layout_options (uint32 LE)
+  Byte 2-5:  layout_options_state (uint32 LE)
   Byte 6-31: 0x00
 
 Response (32B):
@@ -774,19 +1050,36 @@ Response (32B):
 
 **EEPROM 配置**：Remap Header の `layout_options` フィールド（§3.4）に格納。VIA eeconfig 領域は使わない。
 
+**bit field エンコーディング**：`remap_layout_option_t[i].type` に応じて：
+- `boolean`：1 bit を 1 個割り当て（option N が値 v なら `state |= (v & 1) << bit_offset_for_n`）
+- `enum`：`ceil(log2(choice_count))` bit を割り当て（4 choices なら 2 bit）
+- bit 割り当ては option 配列の順序に従い LSB 側から累積。32 bit 上限を超える場合はビルド時エラー。
+
 ### 5.6 Build-time Generation
 
-メタデータの大半（layout、string table 等）は keyboard.json から自動生成される。
+メタデータの大半（layout、string table、layout_options 等）は **`remap.json` から自動生成** される（§3.7 参照）。`remap.json` を SoT として、ビルド時に以下 2 つを派生生成する：
 
-#### `qmk generate-remap-metadata` CLI
+1. `keyboard.json` — QMK ビルド入力（VCS 管理外）
+2. `build/remap_metadata.c` — Remap メタデータ C ソース（VCS 管理外）
 
-QMK CLI の拡張サブコマンド。`keyboard.json` を入力に C ソースを生成：
+#### `qmk generate-from-remap` CLI
+
+QMK CLI の拡張サブコマンド。`remap.json` を入力に **両方の生成物** を一度に出力：
 
 ```bash
-qmk generate-remap-metadata --keyboard <kb> -o build/remap_metadata.c
+qmk generate-from-remap --keyboard <kb>
+# → keyboards/<kb>/keyboard.json
+# → build/remap_metadata.c
 ```
 
-生成内容（例）：
+オプション：
+- `--keyboard-json-only`：`keyboard.json` のみ生成（QMK 互換チェック用）
+- `--metadata-only`：`build/remap_metadata.c` のみ生成
+- `--check`：再生成せず既存生成物が最新か検証（CI 用）
+
+`keyboard.json` 生成は §3.7.4 のトップレベル QMK 派生フィールド（`manufacturer`, `usb`, `matrix_pins`, `features`, `rgblight`, `encoder`, `dynamic_keymap` 等）と `layouts.keymap`（VIA 由来だが QMK の `layouts.<name>.layout` にもマップされる KLE 形式）をそのまま転記し、`remap` namespace と `layouts.options` は除外する。
+
+メタデータ C ソース生成例：
 ```c
 // build/remap_metadata.c (auto-generated)
 #include "remap_metadata.h"
@@ -814,11 +1107,11 @@ const remap_layout_key_t remap_layout_0[] PROGMEM = {
 
 #### make 統合
 
-`build_keyboard.mk` に組み込み、ビルド毎に自動生成：
+`build_keyboard.mk` に組み込み、ビルド毎に自動生成。`remap.json` のタイムスタンプを依存元として両方の生成物が再生成される：
 
 ```makefile
-$(BUILD_DIR)/remap_metadata.c: $(KEYBOARD_PATH)/keyboard.json
-	$(QMK) generate-remap-metadata --keyboard $(KEYBOARD) -o $@
+$(KEYBOARD_PATH)/keyboard.json $(BUILD_DIR)/remap_metadata.c: $(KEYBOARD_PATH)/remap.json
+	$(QMK) generate-from-remap --keyboard $(KEYBOARD)
 ```
 
 PROGMEM 消費は典型 60% キーボードで約 1.1 KB FLASH。
@@ -900,7 +1193,7 @@ encoder の clockwise / counterclockwise キー設定。encoder 数は §5.2 met
 
 ### 6.5 EEPROM 配置
 
-Keymap region は §3.3 の `0x010` から `REMAP_LAYER_COUNT × MATRIX_ROWS × MATRIX_COLS × 2` バイト。Encoder keycode は別領域（keyboard.json で設定、典型 4 layer × 2 enc × 2 dir × 2B = 32B 程度）に配置。詳細レイアウト確定は Open Items 参照。
+Keymap region は §3.3 の `0x010` から `REMAP_LAYER_COUNT × MATRIX_ROWS × MATRIX_COLS × 2` バイト。Encoder keycode は別領域（remap.json で設定、典型 4 layer × 2 enc × 2 dir × 2B = 32B 程度）に配置。詳細レイアウト確定は Open Items 参照。
 
 ---
 
@@ -968,7 +1261,7 @@ QMK の既存仕様を踏襲：
 
 ### 7.5 Build-time 制御
 
-`rules.mk` に `REMAP_MACRO_ENABLE = yes` を設定したキーボードのみ Macro module が有効化される（opt-in）。EEPROM 容量制約（特に 32U4）に配慮し、必要なキーボードだけ有効化する方針。Macro buffer サイズは `keyboard.json` の `remap.macro.buffer_size` で固定（典型 161-196B）。
+`rules.mk` に `REMAP_MACRO_ENABLE = yes` を設定したキーボードのみ Macro module が有効化される（opt-in）。EEPROM 容量制約（特に 32U4）に配慮し、必要なキーボードだけ有効化する方針。Macro buffer サイズは `remap.json` の `remap.macro.buffer_size` で固定（典型 161-196B）。
 
 ### 7.6 Macro count の通知方法
 
@@ -1062,7 +1355,7 @@ custom_slot_t ovr_slots[REMAP_OVR_SLOT_COUNT];    // default 8
 // 合計 ≤ 32（slot 数の論理上限）
 ```
 
-**配分のオーバーライド**は `keyboard.json` で行う：
+**配分のオーバーライド**は `remap.json` で行う：
 
 ```json
 {
@@ -1455,7 +1748,7 @@ typedef struct __attribute__((packed)) {
 per_key_term_entry_t entries[REMAP_PER_KEY_TERM_MAX];  // default 8
 ```
 
-`keyboard.json` で max_entries をオーバーライド可能。
+`remap.json` で max_entries をオーバーライド可能。
 
 #### Sub-commands
 ```
@@ -1513,7 +1806,7 @@ Response (32B):
 ### 14.3 値域・実装方針
 
 - `brightness`：0-255（QMK 内部表現と同じ）
-- `effect`：QMK 内部 mode 値を**透過**（webapp が keyboard.json から有効 mode を知る）
+- `effect`：QMK 内部 mode 値を**透過**（webapp が `remap.json` 由来のメタデータから有効 mode を知る）
 - SET 後の挙動：§3.5 RAM Cache + Save-on-Demand 準拠（RAM cache 即更新で視覚的即時反映、EEPROM commit は遅延）
 - 機能未対応キーボード（`BACKLIGHT_ENABLE = no`）：module 自体がリンクされない → webapp は `STATUS_UNKNOWN_MODULE` を受信して backlight UI を非表示にする
 
@@ -1842,13 +2135,14 @@ REMAP_PER_KEY_TERM_ENABLE      = no
 
 なお Lighting/Audio module（Backlight / RGB Light / RGB Matrix / Audio / LED Matrix）は QMK の標準フラグ（`BACKLIGHT_ENABLE` 等）に追従し、それぞれ ON のときに自動有効化される。
 
-### 20.2 `keyboard.json` schema 拡張
+### 20.2 `remap.json` の `remap` namespace
 
-`data/schemas/keyboard.jsonschema` に `remap` namespace を追加：
+ビルド時のモジュール sizing パラメータは `remap.json` の `remap` namespace に格納する（§3.7.4 参照）。`keyboard.json` には載せない（生成物なので）。
 
 ```json
 {
   "remap": {
+    "schema_version": 1,
     "slots": {
       "tap_dance":    8,
       "combo":        8,
@@ -1869,6 +2163,8 @@ REMAP_PER_KEY_TERM_ENABLE      = no
 - JSON Schema 検証が綺麗
 - 将来モジュール追加時の構造維持しやすい
 - ウェブ UI が namespace 単位でセクション構築しやすい
+
+`data/schemas/remap.jsonschema`（新設）でこの構造を検証する。`keyboard.jsonschema` は既存のまま手を加えない。
 
 ### 20.3 QMK 機能依存の自動制御
 
@@ -1907,7 +2203,7 @@ REMAP_COMBO_LITE_ENABLE     = yes
 
 ### 20.5 メタデータ生成
 
-Section 5.6 参照。`build_keyboard.mk` に組み込み、ビルド毎自動生成。
+`remap.json` を SoT としたビルド時生成フロー。詳細は §3.7 と §5.6 参照。`build_keyboard.mk` が `qmk generate-from-remap` を呼び出し、ビルド毎に `keyboard.json`（QMK ビルド入力）と `remap_metadata.c`（Remap メタデータ）を派生生成する。両者ともに VCS 管理外（`.gitignore` 対象）。
 
 ### 20.6 EEPROM 容量計算
 
@@ -1945,8 +2241,8 @@ make test:remap_slot_converter
 QMK CLI 拡張のテスト：
 
 ```
-lib/python/qmk/tests/test_remap_metadata_gen.py  # generate-remap-metadata CLI
-lib/python/qmk/tests/test_remap_schema.py        # keyboard.json 拡張 schema 検証
+lib/python/qmk/tests/test_remap_metadata_gen.py  # generate-from-remap CLI
+lib/python/qmk/tests/test_remap_schema.py        # remap.json schema 検証
 lib/python/qmk/tests/test_remap_rules_mk.py      # rules.mk 自動制御
 ```
 
@@ -2175,11 +2471,11 @@ Address  Size  Region
 0x342    5 B  RGB Matrix state
 0x347    3 B  LED Matrix state
 0x34A    2 B  Audio state
-0x34C  180 B  Macro Region (keyboard.json で固定、ATmega32U4 残量)
+0x34C  180 B  Macro Region (remap.json で固定、ATmega32U4 残量)
 0x3FF        (end)
 ```
 
-VIA eeconfig (32B) を廃止したことで、旧 spec 試算（Macro 枠 161B）から **+19B** 余裕が生まれている（Header 縮小 +36B − Lighting/Audio 追加 17B = +19B 純増）。実際の Macro 枠は keyboard.json で確定する。
+VIA eeconfig (32B) を廃止したことで、旧 spec 試算（Macro 枠 161B）から **+19B** 余裕が生まれている（Header 縮小 +36B − Lighting/Audio 追加 17B = +19B 純増）。実際の Macro 枠は remap.json で確定する。
 
 ---
 
@@ -2256,3 +2552,5 @@ VIA eeconfig (32B) を廃止したことで、旧 spec 試算（Macro 枠 161B�
 | 2026-04-29 | 初版（Section 1-4 確定） |
 | 2026-05-01 | Section 5-15 追加。Section 7 で根本的設計転換（独自実装 → QMK facade）。 |
 | 2026-05-02 | VIA protocol 完全置換決定に伴う大改修。§4.7 multi-packet transfer 新設、§3.3-§3.6 EEPROM Layout 再構築（VIA eeconfig 廃止 → Remap Header 統合）、§5.1 sub_cmd 再採番（11→7 個）、§5.4 GET_ENCODER_INFO 廃止。新 module 群追加：Keymap (§6)、Macro (§7)、System (§8)、Backlight/RGB Light/RGB Matrix/Audio/LED Matrix (§14-§18)。既存 §6-§16 を §9-§24 に renumbering。R3 / R8 再評価。Open Items に encoder 配置・SET chunked policy 等を追加。 |
+| 2026-05-08 | `remap.json` を SoT とするソース形式設計を §3.7 に新設。Hybrid Option C 構造（QMK passthrough + VIA passthrough + `remap` namespace）、`layouts.options` 構造化（boolean / enum）、`layouts.keymap` の encoder VIA passthrough、v1 機能スコープ（A1/A2/A3/A6/B1/B2/C1/C3/D1/D2/D3/E1）、個別キーボード移行ツールを定義。§5.6 build-time generation を `qmk generate-from-remap` に改名し `keyboard.json` + `remap_metadata.c` の同時生成フローへ更新。§20.2 を `remap.json` の `remap` namespace に再定位（`keyboard.json` 拡張から離脱）。spec 内の `keyboard.json で固定/設定` 系記述を `remap.json` 由来に統一。 |
+| 2026-05-08 (2) | info.json 由来コンテンツのファームウェア保持設計を充実化。§5.4 `remap_layout_key_t` を 8B → **16B 統合構造**に拡張（color RGB / encoder_id / layout_opt 関連付け / Q8.8 rotation を per-key で保持）。§5.5 を State / Metadata の 2 層構成に再構築：`remap_layout_option_t` (4B/option, PROGMEM) を新設し、`GET_LAYOUT_OPTIONS_META` (0x08, §4.7 chunked) を追加。既存 `GET/SET_LAYOUT_OPTIONS` を `_STATE` サフィックス付きに改名して責務を明確化。bit field エンコーディング規約（boolean=1bit, enum=ceil(log2(N))bit）を明記。 |
